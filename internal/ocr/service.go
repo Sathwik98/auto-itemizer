@@ -9,13 +9,13 @@ import (
 	"fmt"
 	"time"
 
-	"auto-itemizer/internal/fileupload"
+	fileuploadcore "auto-itemizer/internal/fileupload/core"
 )
 
 // Provider turns a stored file into raw OCR text. Implementations must stop
 // when ctx is cancelled; HTTP clients for real vendors do.
 type Provider interface {
-	Extract(ctx context.Context, f fileupload.FileUpload) (string, error)
+	Extract(ctx context.Context, f fileuploadcore.FileUpload) (string, error)
 }
 
 // ErrNotConfigured is returned when MOCK_OCR=false: live OCR is out of scope
@@ -35,7 +35,7 @@ func New(p Provider, timeout time.Duration) *Service {
 
 // Extract returns the raw OCR text of f. It returns an error if the provider
 // fails or takes longer than the time limit.
-func (s *Service) Extract(ctx context.Context, f fileupload.FileUpload) (string, error) {
+func (s *Service) Extract(ctx context.Context, f fileuploadcore.FileUpload) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 

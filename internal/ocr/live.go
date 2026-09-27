@@ -3,7 +3,7 @@ package ocr
 import (
 	"context"
 
-	"auto-itemizer/internal/fileupload"
+	fileuploadcore "auto-itemizer/internal/fileupload/core"
 )
 
 // LiveProvider is where a real OCR vendor would plug in when MOCK_OCR=false.
@@ -11,6 +11,6 @@ import (
 // ErrNotConfigured.
 type LiveProvider struct{}
 
-func (LiveProvider) Extract(ctx context.Context, f fileupload.FileUpload) (string, error) {
+func (LiveProvider) Extract(ctx context.Context, f fileuploadcore.FileUpload) (string, error) {
 	return "", ErrNotConfigured
 }

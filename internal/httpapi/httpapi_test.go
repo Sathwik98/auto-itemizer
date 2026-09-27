@@ -19,11 +19,15 @@ import (
 	"time"
 
 	"auto-itemizer/internal/db"
-	"auto-itemizer/internal/expense"
-	"auto-itemizer/internal/fileupload"
+	expensecore "auto-itemizer/internal/expense/core"
+	expenseservice "auto-itemizer/internal/expense/service"
+	fileuploadservice "auto-itemizer/internal/fileupload/service"
+	"auto-itemizer/internal/httpapi/respond"
 	"auto-itemizer/internal/ocr"
-	"auto-itemizer/internal/receipt"
-	"auto-itemizer/internal/receipt/parser"
+	receiptcore "auto-itemizer/internal/receipt/core"
+	"auto-itemizer/internal/receipt/core/parser"
+	receiptserver "auto-itemizer/internal/receipt/server"
+	receiptservice "auto-itemizer/internal/receipt/service"
 
 	"github.com/shopspring/decimal"
 )
@@ -44,7 +48,7 @@ func newAPI(t *testing.T, provider ocr.Provider) http.Handler {
 		t.Fatalf("db.Open: %v", err)
 	}
 	t.Cleanup(func() { d.Close() })
-	files, err := fileupload.New(t.TempDir())
+	files, err := fileuploadservice.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,12 +60,12 @@ func newAPI(t *testing.T, provider ocr.Provider) http.Handler {
 			t.Fatal(err)
 		}
 	}
-	expenses := expense.New(d)
+	expenses := expenseservice.New(d)
 	names, err := expenses.TaxNames(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipts := receipt.New(d, files, ocr.New(provider, time.Second), expenses, parser.New(names))
+	receipts := receiptservice.New(d, files, ocr.New(provider, time.Second), expenses, parser.New(names))
 	expenses.SetParsedReceiptSource(receipts)
 	return NewHandler(receipts, expenses)
 }
@@ -273,7 +277,7 @@ func TestFixturesEndToEnd(t *testing.T) {
 		}
 
 		status := send(t, h, http.MethodGet, "/receipts/"+receiptID, "", nil)
-		if status.str("status") != receipt.StatusProcessed || status.body["failure_reason"] != nil ||
+		if status.str("status") != receiptcore.StatusProcessed || status.body["failure_reason"] != nil ||
 			status.str("expense_id") != processed.str("id") {
 			t.Errorf("%s: GET receipt = %s", name, status.raw)
 		}
@@ -283,7 +287,7 @@ func TestFixturesEndToEnd(t *testing.T) {
 func TestUploadResponse(t *testing.T) {
 	h := newAPI(t, nil)
 	res := upload(t, h, "receipt-clean.txt", "text/plain; charset=utf-8", []byte("MERCHANT: x"))
-	if res.status != http.StatusCreated || res.str("status") != receipt.StatusUploaded || res.str("receipt_id") == "" {
+	if res.status != http.StatusCreated || res.str("status") != receiptcore.StatusUploaded || res.str("receipt_id") == "" {
 		t.Fatalf("upload = %d %s", res.status, res.raw)
 	}
 	if loc := res.header.Get("Location"); loc != "/receipts/"+res.str("receipt_id") {
@@ -299,17 +303,17 @@ func TestUploadResponse(t *testing.T) {
 func TestGuardFixtures(t *testing.T) {
 	h := newAPI(t, nil)
 	for name, code := range map[string]string{
-		"unreadable":        receipt.CodeOCRUnreadable,
-		"not-a-receipt":     receipt.CodeNotAReceipt,
-		"header-incomplete": receipt.CodeHeaderIncomplete,
-		"invalid-values":    receipt.CodeInvalidReceiptValues,
+		"unreadable":        receiptcore.CodeOCRUnreadable,
+		"not-a-receipt":     receiptcore.CodeNotAReceipt,
+		"header-incomplete": receiptcore.CodeHeaderIncomplete,
+		"invalid-values":    receiptcore.CodeInvalidReceiptValues,
 	} {
 		receiptID := uploadFixture(t, h, "mock-ocr", name)
 		res := send(t, h, http.MethodPost, "/receipts/"+receiptID+"/process", "", nil)
 		wantError(t, name, res, http.StatusUnprocessableEntity, code)
 
 		status := send(t, h, http.MethodGet, "/receipts/"+receiptID, "", nil)
-		if status.str("status") != receipt.StatusFailed || status.str("failure_reason") != code || status.body["expense_id"] != nil {
+		if status.str("status") != receiptcore.StatusFailed || status.str("failure_reason") != code || status.body["expense_id"] != nil {
 			t.Errorf("%s: GET receipt = %s", name, status.raw)
 		}
 	}
@@ -351,13 +355,13 @@ func TestPatchAndReitemize(t *testing.T) {
 	res = sendJSON(t, h, http.MethodPatch, path, fmt.Sprintf(
 		`[{"id":%q,"description":"Water","amount":"4.00"},{"id":%q,"description":"Snacks","amount":"6.00"},{"description":"Minibar","amount":6.60}]`,
 		water, snacks))
-	if res.status != http.StatusOK || res.str("itemize_status") != expense.StatusComplete {
+	if res.status != http.StatusOK || res.str("itemize_status") != expensecore.StatusComplete {
 		t.Fatalf("PATCH that reconciles = %d %s", res.status, res.raw)
 	}
 
 	// Re-itemize goes back to the automatic result.
 	res = send(t, h, http.MethodPost, "/transactions/"+id+"/itemize", "", nil)
-	if res.status != http.StatusOK || res.str("itemize_status") != expense.StatusNeedsReview || res.str("id") != id {
+	if res.status != http.StatusOK || res.str("itemize_status") != expensecore.StatusNeedsReview || res.str("id") != id {
 		t.Errorf("re-itemize = %d %s", res.status, res.raw)
 	}
 }
@@ -414,10 +418,10 @@ func TestUploadErrors(t *testing.T) {
 	wantError(t, "no content type", upload(t, h, "receipt", "", []byte("data")), http.StatusUnsupportedMediaType, "UNSUPPORTED_FILE_TYPE")
 
 	// 10 MB + 1 byte fits in the body limit, so the size check catches it.
-	justOver := bytes.Repeat([]byte("a"), maxUploadBytes+1)
+	justOver := bytes.Repeat([]byte("a"), receiptserver.MaxUploadBytes+1)
 	wantError(t, "file just over 10 MB", upload(t, h, "big.txt", "text/plain", justOver), http.StatusRequestEntityTooLarge, "FILE_TOO_LARGE")
 	// A body over the 11 MB cap is cut off while reading.
-	huge := bytes.Repeat([]byte("a"), maxUploadBody+1)
+	huge := bytes.Repeat([]byte("a"), receiptserver.MaxUploadBody+1)
 	wantError(t, "body over the cap", upload(t, h, "huge.txt", "text/plain", huge), http.StatusRequestEntityTooLarge, "FILE_TOO_LARGE")
 }
 
@@ -433,14 +437,14 @@ func TestMockFallback(t *testing.T) {
 	res := upload(t, h, "photo.png", "image/png", []byte("fake png bytes"))
 	processed := send(t, h, http.MethodPost, "/receipts/"+res.str("receipt_id")+"/process", "", nil)
 	if processed.status != http.StatusOK || processed.str("merchant") != "Cafe Mitte" ||
-		processed.str("itemize_status") != expense.StatusComplete {
+		processed.str("itemize_status") != expensecore.StatusComplete {
 		t.Errorf("fallback = %d %s; want the gold receipt", processed.status, processed.raw)
 	}
 }
 
 func TestInternalErrorsDontLeak(t *testing.T) {
 	rec := httptest.NewRecorder()
-	writeError(rec, httptest.NewRequest(http.MethodGet, "/x", nil), errors.New("sqlite: disk I/O error at /secret/path"))
+	respond.WriteError(rec, httptest.NewRequest(http.MethodGet, "/x", nil), errors.New("sqlite: disk I/O error at /secret/path"))
 	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "secret") ||
 		!strings.Contains(rec.Body.String(), "INTERNAL_ERROR") {
 		t.Errorf("unexpected error = %d %s; want a generic 500", rec.Code, rec.Body.String())

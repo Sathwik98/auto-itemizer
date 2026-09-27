@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"auto-itemizer/internal/fileupload"
+	fileuploadcore "auto-itemizer/internal/fileupload/core"
 )
 
 var ctx = context.Background()
@@ -49,8 +49,8 @@ func newTestMock(t *testing.T) *MockProvider {
 
 // upload returns a file_upload whose stored file doesn't exist, which proves
 // the mock never reads it.
-func upload(fileName string) fileupload.FileUpload {
-	return fileupload.FileUpload{ID: "file-1", FileName: fileName, FilePath: "/no/such/file"}
+func upload(fileName string) fileuploadcore.FileUpload {
+	return fileuploadcore.FileUpload{ID: "file-1", FileName: fileName, FilePath: "/no/such/file"}
 }
 
 func TestMockReturnsFixtureByUploadedName(t *testing.T) {
@@ -113,7 +113,7 @@ type fakeProvider struct {
 	hang bool
 }
 
-func (p fakeProvider) Extract(ctx context.Context, f fileupload.FileUpload) (string, error) {
+func (p fakeProvider) Extract(ctx context.Context, f fileuploadcore.FileUpload) (string, error) {
 	if p.hang {
 		<-ctx.Done()
 		return "", ctx.Err()
