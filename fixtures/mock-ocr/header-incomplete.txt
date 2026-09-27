@@ -1,0 +1,6 @@
+CURRENCY: EUR
+
+Espresso                    3.50
+Sandwich                    8.90
+
+TOTAL                      12.40

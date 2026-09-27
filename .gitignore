@@ -1,0 +1,13 @@
+# Runtime data: uploaded files and the SQLite database
+storage/
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets
+.env
+
+# The original brief; its fixtures are copied to fixtures/task-a/
+/task-a/
+
+.DS_Store
