@@ -14,7 +14,9 @@ import (
 	"net/http/httptest"
 	"net/textproto"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -318,5 +320,127 @@ func TestServeReturnsWhenServeFails(t *testing.T) {
 	go func() { done <- serve(serveCtx, inner, http.NotFoundHandler()) }()
 	if err := waitFor(t, done); err == nil {
 		t.Error("serve = nil, want Serve's error")
+	}
+}
+
+// TestSignalChild is the server process of the signal tests below, which run
+// this test binary again with SIGNAL_TEST_CHILD set. In a normal run it is
+// skipped. A request to it waits until its client hangs up, so it holds the
+// shutdown open.
+func TestSignalChild(t *testing.T) {
+	if os.Getenv("SIGNAL_TEST_CHILD") != "1" {
+		t.Skip("runs only as the child process of the signal tests")
+	}
+	sigCtx, stop := signalContext()
+	defer stop()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hold := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("REQUEST STARTED")
+		<-r.Context().Done()
+	})
+	fmt.Println("ADDRESS", ln.Addr())
+	if err := serve(sigCtx, ln, hold); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+}
+
+// startSignalChild runs TestSignalChild in a new process. It returns the
+// process, its output lines (stdout and stderr) and the address it serves on.
+func startSignalChild(t *testing.T) (*exec.Cmd, <-chan string, string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("sends SIGINT, which Windows doesn't have")
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestSignalChild$", "-test.v")
+	cmd.Env = append(os.Environ(), "SIGNAL_TEST_CHILD=1")
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = cmd.Stdout // one stream, so slog's lines arrive too
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill() })
+	lines := make(chan string, 100)
+	go func() {
+		scanner := bufio.NewScanner(out)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	addr := strings.TrimPrefix(waitLine(t, lines, "ADDRESS "), "ADDRESS ")
+	return cmd, lines, addr
+}
+
+// waitLine returns the child's next output line that contains part.
+func waitLine(t *testing.T, lines <-chan string, part string) string {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatalf("the child ended before printing %q", part)
+			}
+			if strings.Contains(line, part) {
+				return line
+			}
+		case <-deadline:
+			t.Fatalf("the child didn't print %q", part)
+		}
+	}
+}
+
+// waitExit returns the child's exit error on a channel once it has ended.
+func waitExit(cmd *exec.Cmd) <-chan error {
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	return done
+}
+
+// A second Ctrl-C ends the program at once, even while the shutdown waits
+// for a request in flight, which would otherwise take shutdownTimeout.
+func TestSecondSignalQuitsAtOnce(t *testing.T) {
+	cmd, lines, addr := startSignalChild(t)
+	go http.Get("http://" + addr + "/") // held open until the child ends
+	waitLine(t, lines, "REQUEST STARTED")
+	cmd.Process.Signal(os.Interrupt)
+	waitLine(t, lines, "shutting down") // the first Ctrl-C started the shutdown
+	done := waitExit(cmd)
+
+	// Press Ctrl-C again. It is repeated because the signals are released
+	// just after "shutting down" is logged, not before it.
+	again := time.NewTicker(50 * time.Millisecond)
+	defer again.Stop()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-done:
+			return
+		case <-again.C:
+			cmd.Process.Signal(os.Interrupt)
+		case <-deadline:
+			t.Fatal("the program was still running 2 s after the second Ctrl-C")
+		}
+	}
+}
+
+// One Ctrl-C with nothing in flight still shuts down cleanly, with exit 0.
+func TestOneSignalShutsDownCleanly(t *testing.T) {
+	cmd, lines, _ := startSignalChild(t)
+	cmd.Process.Signal(os.Interrupt)
+	waitLine(t, lines, "shutting down")
+	select {
+	case err := <-waitExit(cmd):
+		if err != nil {
+			t.Errorf("the program ended with %v, want exit 0", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the program did not stop after Ctrl-C")
 	}
 }

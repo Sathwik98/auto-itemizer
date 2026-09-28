@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"auto-itemizer/internal/db"
 	"auto-itemizer/internal/expense/core"
@@ -195,6 +196,15 @@ func (s *Service) PatchItems(ctx context.Context, id string, items []core.ItemIn
 	if err != nil {
 		return core.Expense{}, err
 	}
+	// Descriptions are checked, compared and stored without surrounding
+	// spaces: a blank one counts as empty, and " Water " is the same item as
+	// "Water". The caller's slice is left as it was.
+	trimmed := make([]core.ItemInput, len(items))
+	for i, item := range items {
+		item.Description = strings.TrimSpace(item.Description)
+		trimmed[i] = item
+	}
+	items = trimmed
 	if err := checkItems(e, items); err != nil {
 		return core.Expense{}, err
 	}
@@ -218,8 +228,8 @@ func (s *Service) PatchItems(ctx context.Context, id string, items []core.ItemIn
 }
 
 // checkItems applies the PATCH rules: every id is an active item of e and
-// appears once, every description is non-empty, and every amount is non-zero
-// with at most two decimals.
+// appears once, every description is non-empty (PatchItems has trimmed it
+// already), and every amount is non-zero with at most two decimals.
 func checkItems(e core.Expense, items []core.ItemInput) error {
 	active := make(map[string]bool, len(e.LineItems))
 	for _, item := range e.LineItems {

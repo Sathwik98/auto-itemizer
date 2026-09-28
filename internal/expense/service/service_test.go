@@ -516,6 +516,7 @@ func TestPatchItemsRejectsInvalidItems(t *testing.T) {
 		"three decimals":    {{Description: "Minibar", Amount: dec("16.595")}},
 		"zero amount":       {keep(water), {Description: "Free", Amount: dec("0")}, {Description: "Rest", Amount: dec("12.60")}},
 		"empty description": {{Description: "", Amount: dec("16.60")}},
+		"blank description": {{Description: " \t ", Amount: dec("16.60")}},
 		"repeated id":       {keep(water), keep(water), {Description: "Rest", Amount: dec("8.60")}},
 	}
 	for name, items := range cases {
@@ -525,6 +526,27 @@ func TestPatchItemsRejectsInvalidItems(t *testing.T) {
 	}
 	if after := summary(mustGet(t, s, e.ID)); after != before {
 		t.Errorf("an invalid PATCH wrote:\n%s", after)
+	}
+}
+
+// Descriptions are stored without surrounding spaces, so " Water " sent with
+// Water's id is the unchanged Water and keeps its row.
+func TestPatchItemsTrimsDescriptions(t *testing.T) {
+	s, d := setup(t)
+	e := create(t, s, d, readFixture(t, "receipt-mismatch"))
+	water, snacks := e.LineItems[0], e.LineItems[1]
+
+	got, err := s.PatchItems(ctx, e.ID, []core.ItemInput{
+		{ID: water.ID, Description: " Water ", Amount: water.Amount},
+		keep(snacks),
+		{Description: "  Minibar\t", Amount: dec("6.60")},
+	})
+	if err != nil {
+		t.Fatalf("PatchItems: %v", err)
+	}
+	if len(got.LineItems) != 3 || got.LineItems[0].ID != water.ID || got.LineItems[0].Description != "Water" ||
+		got.LineItems[2].Description != "Minibar" {
+		t.Errorf("after a PATCH with spaces: %s; want Water kept with its id, and Minibar stored trimmed", summary(got))
 	}
 }
 

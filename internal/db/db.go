@@ -1,11 +1,10 @@
-// Package db opens the SQLite database, applies the schema and runs
+// Package db opens the SQLite database, applies the migrations and runs
 // transactions that services pass to each other (ARCHITECTURE.md §1.1).
 package db
 
 import (
 	"context"
 	"database/sql"
-	_ "embed"
 	"errors"
 	"fmt"
 	"os"
@@ -14,9 +13,6 @@ import (
 
 	_ "modernc.org/sqlite" // registers the "sqlite" driver
 )
-
-//go:embed schema.sql
-var schema string
 
 // Connection settings, applied to every connection in the pool:
 //   - foreign_keys: enforce the REFERENCES clauses.
@@ -55,7 +51,7 @@ type DB struct {
 }
 
 // Open connects to the SQLite file at path, creating the file and its folder
-// if needed, and applies the schema and seed data.
+// if needed, and applies the migrations the database hasn't had yet (migrate.go).
 func Open(ctx context.Context, path string) (*DB, error) {
 	// An empty path makes the driver read dsnParams as the file name and skip
 	// every setting, and ":memory:" gives each pooled connection its own empty
@@ -70,11 +66,12 @@ func Open(ctx context.Context, path string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
-	if _, err := sqlDB.ExecContext(ctx, schema); err != nil {
+	d := &DB{sqlDB}
+	if err := migrate(ctx, d, migrationFiles); err != nil {
 		sqlDB.Close()
-		return nil, fmt.Errorf("apply schema: %w", err)
+		return nil, err
 	}
-	return &DB{sqlDB}, nil
+	return d, nil
 }
 
 // InTx runs fn in one transaction. It commits if fn returns nil, and rolls

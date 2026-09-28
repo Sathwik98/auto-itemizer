@@ -56,6 +56,11 @@ func NewHandler(receipts *receiptservice.Service, expenses *expenseservice.Servi
 	return logRequests(recoverPanics(mux))
 }
 
+// statusClientClosed is recorded for a request whose client went away before
+// an answer was written. It is nginx's "client closed request"; no response
+// with this code is ever sent.
+const statusClientClosed = 499
+
 // logRequests writes one log line per request and records it in the metrics
 // (ARCHITECTURE.md §3.8). The level follows the status: INFO below 400, WARN
 // for 4xx, ERROR for 5xx. GET /metrics is counted but not logged, because
@@ -74,7 +79,10 @@ func logRequests(next http.Handler) http.Handler {
 			route = "unmatched"
 		}
 		status := rec.status
-		if status == 0 {
+		switch {
+		case status == 0 && r.Context().Err() != nil:
+			status = statusClientClosed // the client left, so there was no one to answer
+		case status == 0:
 			status = http.StatusOK // the handler wrote nothing
 		}
 		metrics.RecordRequest(route, status, duration)

@@ -37,15 +37,27 @@ func main() {
 		slog.Error("bad setting", "error", err)
 		os.Exit(1)
 	}
-	// ctx ends at the first Ctrl-C (SIGINT) or SIGTERM, which starts the
-	// shutdown.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signalContext()
 	err = run(ctx, cfg)
 	stop()
 	if err != nil {
 		slog.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+// signalContext returns a context that ends at the first Ctrl-C (SIGINT) or
+// SIGTERM, which starts the shutdown. Then it releases the signals, so a
+// second Ctrl-C ends the program at once instead of waiting up to
+// shutdownTimeout for the requests in flight. Calling stop more than once is
+// fine.
+func signalContext() (context.Context, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ctx.Done()
+		stop() // back to Go's default: the next Ctrl-C or SIGTERM ends the program
+	}()
+	return ctx, stop
 }
 
 // run starts the service and blocks until ctx ends, then shuts it down. The
@@ -106,7 +118,7 @@ func newHandler(ctx context.Context, cfg config.Config, d *db.DB, provider ocr.P
 	// Without tax names, a line like "VAT 19% 2.85" would be read as an item,
 	// and the receipt could still come out COMPLETE: a silent wrong answer.
 	if len(names) == 0 {
-		return nil, errors.New("tax_master has no tax names, so no line would be read as a tax; check the seed in internal/db/schema.sql")
+		return nil, errors.New("tax_master has no tax names, so no line would be read as a tax; check internal/db/migrations/0002_seed_tax_names.sql")
 	}
 	receipts := receiptservice.New(d, files, ocr.New(provider, ocrTimeout), expenses, parser.New(names))
 	expenses.SetParsedReceiptSource(receipts) // the two services need each other

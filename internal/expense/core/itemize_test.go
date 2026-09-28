@@ -119,6 +119,7 @@ func TestTaxableAmount(t *testing.T) {
 	}{
 		{"one tax with a subtotal", readFixture(t, "receipt-clean"), []string{"15.00"}},
 		{"one incl. tax", readFixture(t, "receipt-tax-only"), []string{"20.17"}},
+		{"one incl. tax with a subtotal, which already contains it", "Food 11.90\nSubtotal 11.90\nincl. VAT 19% 1.90\nTOTAL 11.90", []string{"10.00"}},
 		{"one tax, no subtotal, not incl.", "Food 10.00\nVAT 19% 1.90\nTOTAL 11.90", []string{""}},
 		{"several taxes share one subtotal", "Poutine 10.00\nSubtotal 10.00\nGST 5% 0.50\nQST 9.975% 1.00\nTOTAL 11.50", []string{"", ""}},
 		{"a printed base wins over the subtotal", "Food 10.00\nSubtotal 10.00\nVAT 19%  9.00  1.90\nTOTAL 11.90", []string{"9.00"}},

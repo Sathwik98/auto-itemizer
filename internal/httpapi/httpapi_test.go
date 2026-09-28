@@ -24,6 +24,7 @@ import (
 	"auto-itemizer/internal/db"
 	expensecore "auto-itemizer/internal/expense/core"
 	expenseservice "auto-itemizer/internal/expense/service"
+	fileuploadcore "auto-itemizer/internal/fileupload/core"
 	fileuploadservice "auto-itemizer/internal/fileupload/service"
 	"auto-itemizer/internal/httpapi/respond"
 	"auto-itemizer/internal/metrics"
@@ -354,6 +355,8 @@ func TestPatchAndReitemize(t *testing.T) {
 		`[{"id":"no-such-item","description":"Water","amount":"18.50"}]`), http.StatusBadRequest, "UNKNOWN_ITEM")
 	wantError(t, "zero amount", sendJSON(t, h, http.MethodPatch, path,
 		`[{"description":"Water","amount":0}]`), http.StatusBadRequest, "INVALID_ITEM")
+	wantError(t, "blank description", sendJSON(t, h, http.MethodPatch, path,
+		`[{"description":"   ","amount":"16.60"}]`), http.StatusBadRequest, "INVALID_ITEM")
 
 	// Adding the missing 6.60 reconciles. A numeric amount works too.
 	res = sendJSON(t, h, http.MethodPatch, path, fmt.Sprintf(
@@ -685,6 +688,37 @@ func TestRequestLogAndMetrics(t *testing.T) {
 		`level=WARN msg=request method=GET path=/no/such/path route=unmatched status=404`)
 	if strings.Contains(logs.String(), "path=/metrics") {
 		t.Errorf("GET /metrics was logged:\n%s", logs.String())
+	}
+}
+
+// hangUpProvider is an OCR provider for a client that disconnects during OCR:
+// it cancels the request's context and returns once that context has ended.
+type hangUpProvider struct{ cancel context.CancelFunc }
+
+func (p hangUpProvider) Extract(ctx context.Context, f fileuploadcore.FileUpload) (string, error) {
+	p.cancel()
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+// A client that leaves before its answer is written is logged and counted
+// as 499, not 200, and the receipt is left as it was.
+func TestClientGoneIsLoggedAs499(t *testing.T) {
+	requestCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	h := newAPI(t, hangUpProvider{cancel: cancel})
+	receiptID := uploadFixture(t, h, "task-a", "receipt-clean")
+	logs := captureLogs(t)
+	series := `http_requests_total{route="POST /receipts/{id}/process",status="499"}`
+	before := metricValue(t, series)
+
+	req := httptest.NewRequest(http.MethodPost, "/receipts/"+receiptID+"/process", nil).WithContext(requestCtx)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	wantIncrease(t, series, before, 1)
+	wantLog(t, logs, `level=WARN msg=request method=POST path=/receipts/`+receiptID+`/process route="POST /receipts/{id}/process" status=499`)
+	if status := send(t, h, http.MethodGet, "/receipts/"+receiptID, "", nil); status.str("status") != receiptcore.StatusUploaded {
+		t.Errorf("after the client left: %s, want the receipt still UPLOADED", status.raw)
 	}
 }
 

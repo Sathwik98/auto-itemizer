@@ -43,8 +43,9 @@ func Itemize(lines []parser.Line, taxes []decimal.Decimal, total decimal.Decimal
 // TaxableAmount is the net amount a tax was charged on, when the receipt
 // shows it (ARCHITECTURE.md §2). In order:
 //  1. the base printed on the tax line ("VAT 19%  10.00  1.90");
-//  2. with exactly one tax line, the subtotal, or for an "incl." tax the
-//     total minus the tax;
+//  2. with exactly one tax line: for an "incl." tax the total minus the tax,
+//     otherwise the subtotal. An "incl." tax comes first because its prices,
+//     and so any subtotal of them, already contain the tax;
 //  3. otherwise nil: a subtotal shared by several taxes is no single tax's base.
 func TaxableAmount(p parser.ParsedReceipt, tax parser.Tax) *decimal.Decimal {
 	if tax.Base != nil {
@@ -53,12 +54,12 @@ func TaxableAmount(p parser.ParsedReceipt, tax parser.Tax) *decimal.Decimal {
 	if len(p.Taxes) != 1 {
 		return nil
 	}
-	if p.Subtotal != nil {
-		return p.Subtotal
-	}
 	if tax.Inclusive && p.Total != nil {
 		net := p.Total.Sub(tax.Amount)
 		return &net
+	}
+	if p.Subtotal != nil {
+		return p.Subtotal
 	}
 	return nil
 }

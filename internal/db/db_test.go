@@ -141,7 +141,7 @@ func TestOpenAppliesSchemaAndSeedOnce(t *testing.T) {
 }
 
 // TestSchemaHasAllTables checks the tables and indexes of ARCHITECTURE.md §2
-// by name, so one missing from schema.sql is noticed here.
+// by name, so one missing from the migrations is noticed here.
 func TestSchemaHasAllTables(t *testing.T) {
 	d, err := Open(ctx, filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -169,7 +169,7 @@ func TestSchemaHasAllTables(t *testing.T) {
 		return list
 	}
 
-	wantTables := []string{"expense", "expense_line_item", "expense_tax", "file_upload", "receipt_ocr", "receipts", "tax_master"}
+	wantTables := []string{"expense", "expense_line_item", "expense_tax", "file_upload", "receipt_ocr", "receipts", "schema_migrations", "tax_master"}
 	if got := names("table"); !slices.Equal(got, wantTables) {
 		t.Errorf("tables = %v, want %v", got, wantTables)
 	}

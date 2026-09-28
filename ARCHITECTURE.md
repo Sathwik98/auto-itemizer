@@ -60,8 +60,8 @@ The receipt parser returns `ParsedReceipt { merchant, date, currency, total, sub
 
 | `MOCK_OCR` | Provider inside `OcrService` | Behaviour |
 |---|---|---|
-| `true` | `MockOcrProvider` | 1. Take the stem of `file_upload.file_name`, e.g. `receipt-clean.png` → `receipt-clean`.<br>2. If mock OCR data exists under that name (`fixtures/task-a/<stem>.txt`, or our extra fixtures in `fixtures/mock-ocr/<stem>.txt`), return it as `raw_text`.<br>3. Otherwise **fall back to the gold OCR text**: `fixtures/task-a/receipt-clean.txt`, which can be changed with `MOCK_OCR_FALLBACK`. The fallback is logged. |
-| `false` | `LiveOcrProvider` | Calls a real OCR vendor. **Out of scope for now.** `process` returns **501** `LIVE_OCR_NOT_CONFIGURED` before writing anything. |
+| `true` | `MockProvider` | 1. Take the stem of `file_upload.file_name`, e.g. `receipt-clean.png` → `receipt-clean`.<br>2. If mock OCR data exists under that name (`fixtures/task-a/<stem>.txt`, or our extra fixtures in `fixtures/mock-ocr/<stem>.txt`), return it as `raw_text`.<br>3. Otherwise **fall back to the gold OCR text**: `fixtures/task-a/receipt-clean.txt`, which can be changed with `MOCK_OCR_FALLBACK`. The fallback is logged. |
+| `false` | `LiveProvider` | Calls a real OCR vendor. **Out of scope for now:** it answers at once that it isn't configured, so `process` returns **501** `LIVE_OCR_NOT_CONFIGURED` before writing anything. |
 
 ### 1.3 Guards
 
@@ -85,7 +85,9 @@ A receipt with **no tax line** is not a guard failure. It gets zero `expense_tax
 
 ## 2. Data model
 
-All tables have the audit columns `id`, `created_at`, `created_by`, `updated_at` and `updated_by`. There is no auth, so `created_by`/`updated_by` is `"system"` for pipeline writes and `"user"` for writes through `PATCH`.
+The service creates these tables itself: numbered migrations run at startup and record what they applied in a `schema_migrations` table (IMPLEMENTATION_PLAN.md §3).
+
+All the tables below have the audit columns `id`, `created_at`, `created_by`, `updated_at` and `updated_by`. There is no auth, so `created_by`/`updated_by` is `"system"` for pipeline writes and `"user"` for writes through `PATCH`.
 
 Money columns are `NUMERIC(12,2)` and are handled as `Decimal` in code, **never float**. Tax rates are exact decimals, stored as printed: 19% is `0.19` and a Quebec QST of 9.975% is `0.09975`, never rounded.
 
@@ -118,7 +120,7 @@ Details of the stored file. They are kept apart from `receipts` so the receipt o
 |---|---|---|
 | file_id | FK → file_upload, UNIQUE | One file per receipt |
 | status | TEXT | `UPLOADED` → `OCR_EXTRACTED` → `PROCESSED`, or `FAILED` |
-| failure_reason | TEXT NULL | Error code of the guard that failed (e.g. `NOT_A_RECEIPT`, §1.3). Set together with `FAILED`, and cleared to NULL when the receipt reaches `PROCESSED`. Returned by `GET /receipts/{id}` (§3.3). |
+| failure_reason | TEXT NULL | Error code of the guard that failed (e.g. `NOT_A_RECEIPT`, §1.3). Set together with `FAILED`, and cleared to NULL when the receipt is processed again and its OCR text is saved (§3.2). Returned by `GET /receipts/{id}` (§3.3). |
 
 ### `receipt_ocr`
 **Owner:** `ReceiptService`
@@ -150,7 +152,7 @@ Details of the stored file. They are kept apart from `receipts` so the receipt o
 | expense_id | FK → expense | |
 | tax_master_id | FK → tax_master | Which tax (VAT, GST, …) |
 | rate | exact decimal | Printed rate as a fraction, e.g. `0.19` for 19%; never rounded |
-| taxable_amount | NUMERIC(12,2) NULL | Net amount the tax is charged on, when the receipt shows it: the base printed on the tax line (`VAT 19%  10.00  1.90` → `10.00`); otherwise, with exactly one tax line, the `Subtotal`, or for a tax-inclusive total (`incl. VAT`) `total − tax_amount`. Otherwise NULL: a subtotal shared by several taxes is no single tax's base, so it isn't copied onto their rows. |
+| taxable_amount | NUMERIC(12,2) NULL | Net amount the tax is charged on, when the receipt shows it: the base printed on the tax line (`VAT 19%  10.00  1.90` → `10.00`); otherwise, with exactly one tax line: for a tax-inclusive total (`incl. VAT`) `total − tax_amount`, because those prices, and so any `Subtotal` of them, already contain the tax; for any other tax the `Subtotal`. Otherwise NULL: a subtotal shared by several taxes is no single tax's base, so it isn't copied onto their rows. |
 | tax_amount | NUMERIC(12,2) | Tax amount as printed. **Never recalculated from the rate.** |
 
 There is one row per tax per rate, and zero rows when the receipt prints no tax. This table is the **only** place tax is stored. See §5 for why taxes are not split across line items.
@@ -170,7 +172,7 @@ There is one row per tax per rate, and zero rows when the receipt prints no tax.
 
 | column | type | notes |
 |---|---|---|
-| name | TEXT **UNIQUE** | `VAT`, `GST`, `CGST`, `SGST`, … Seeded, and upserted by `ExpenseService` when a parsed receipt contains a new tax name. It is also the parser's list of tax names: they are loaded once at startup, so a new seed row or upserted name is recognised after the next restart (§4). |
+| name | TEXT **UNIQUE** | `VAT`, `GST`, `CGST`, `SGST`, … Seeded by a migration, and upserted by `ExpenseService` when a parsed receipt contains a new tax name. It is also the parser's list of tax names: they are loaded once at startup, so a name added by a new migration or upserted is recognised after the next restart (§4). |
 
 **Soft deletes.** `receipt_ocr`, `expense` and `expense_line_item` have `is_deleted`. Child rows of a soft-deleted expense (its `expense_tax` and `expense_line_item` rows) are **not** flagged. They stay as they were and can only be reached through their deleted parent, which keeps the history intact.
 
@@ -193,7 +195,7 @@ There is one row per tax per rate, and zero rows when the receipt prints no tax.
 | 400 | `FILE_EMPTY` | The uploaded file has 0 bytes |
 | 400 | `INVALID_UPLOAD` | `POST /receipts` isn't a multipart form |
 | 400 | `INVALID_BODY` | The `PATCH` body isn't one JSON array of items: malformed JSON, `null`, a field other than `id`, `description` and `amount`, or anything after the array |
-| 400 | `INVALID_ITEM` | A `PATCH` item has no description, an amount of 0 or with more than two decimals, or repeats an id (§3.6) |
+| 400 | `INVALID_ITEM` | A `PATCH` item has an empty or blank description, an amount of 0 or with more than two decimals, or repeats an id (§3.6) |
 | 400 | `UNKNOWN_ITEM` | A `PATCH` item's id isn't an active item of this expense |
 | 404 | `NOT_FOUND` | An unknown receipt or transaction id (a soft-deleted transaction counts as unknown), or an unknown path |
 | 405 | `METHOD_NOT_ALLOWED` | A known path with another method; the `Allow` header lists the right one |
@@ -258,14 +260,15 @@ sequenceDiagram
     alt unknown receipt
         RS-->>RC: not found
         RC-->>C: 404 NOT_FOUND
-    else MOCK_OCR is false
-        RS-->>RC: live OCR not configured
-        RC-->>C: 501 LIVE_OCR_NOT_CONFIGURED (nothing written)
     else
         RS->>FUS: get(file_id)
         FUS-->>RS: file_upload
         RS->>OS: extract(file_upload)
-        alt OCR call fails
+        alt MOCK_OCR is false
+            OS-->>RS: live OCR not configured
+            RS-->>RC: live OCR not configured
+            RC-->>C: 501 LIVE_OCR_NOT_CONFIGURED (nothing written)
+        else OCR call fails
             Note over RS,ES: one save
             RS->>ES: softDeleteActiveForReceipt(receipt_id)
             RS->>RS: FAILED, failure_reason OCR_FAILED, commit
@@ -299,17 +302,16 @@ Nothing is written until the OCR call has returned. After that there are **two s
 
 | Phase | Tables | Action |
 |---|---|---|
-| **1. Pre-check** | — | If `MOCK_OCR=false`, return 501 `LIVE_OCR_NOT_CONFIGURED`. **Nothing is written.** |
+| **1. Live OCR check** | — | If `MOCK_OCR=false`, the live provider answers the OCR call at once that it isn't configured, and `process` returns 501 `LIVE_OCR_NOT_CONFIGURED`. **Nothing is written.** |
 | **2. OCR call** | — | `OcrService.extract(file_upload)` → `raw_text`. **Nothing is written.** |
 | **3. Save OCR** (1 transaction) | `expense` | `ExpenseService.softDeleteActiveForReceipt`: if this receipt has an active expense, **soft-delete** it |
 | | `receipt_ocr` | Soft-delete the active row, then **INSERT** a new one with `ocr_payload = raw_text`. This happens even if later guards fail, so the text that failed is kept for debugging. |
 | | `receipts` | `status = OCR_EXTRACTED`, `failure_reason = NULL` |
 | **4. Guards + parse** | — | `ReceiptService` runs guards 2–5 (§1.3) and parses the text into a `ParsedReceipt`, in memory. **Nothing is written.** |
-| **5. Save expense** (1 transaction) | `tax_master` | `ExpenseService.createFromReceipt` (this row and the next four): upsert each tax name found |
-| | `expense` | **INSERT** a new row with the header fields |
+| **5. Save expense** (1 transaction) | `tax_master` | `ExpenseService.createFromReceipt` (this row and the next three): upsert each tax name found |
+| | `expense` | **INSERT** a new row with the header fields and the `itemization_status` from itemize and reconcile (§4) |
 | | `expense_tax` | **INSERT** one row per parsed tax (`tax_master_id`, `rate`, `taxable_amount`, `tax_amount`) |
 | | `expense_line_item` | **INSERT** the parsed items |
-| | `expense` | Set `itemization_status` from itemize and reconcile (§4) |
 | | `receipts` | `status = PROCESSED` |
 
 **Failures**
@@ -488,7 +490,7 @@ sequenceDiagram
 
 | Step | Action |
 |---|---|
-| Validate | Each item needs a non-empty description and a non-zero decimal amount with at most 2 decimal places. Negative amounts are allowed for discounts. Every `id` must be an active item of this expense (else **400** `UNKNOWN_ITEM`), and no `id` may appear twice. A broken rule gets **400** `INVALID_ITEM`. `ExpenseService` checks these rules, not the controller, so no caller can store a rounded or duplicated item. The controller only checks the JSON: one array whose items have no fields besides `id`, `description` and `amount` (a `tax_amount` isn't silently dropped), else **400** `INVALID_BODY`. `amount` can be sent as `"6.60"` or `6.60`; both are read exactly. An empty list `[]` is valid input, but it only reconciles if the taxes alone equal the total, so in practice it gets a 409. |
+| Validate | Each item needs a description that isn't empty once surrounding spaces are removed (it is stored without them), and a non-zero decimal amount with at most 2 decimal places. Negative amounts are allowed for discounts. Every `id` must be an active item of this expense (else **400** `UNKNOWN_ITEM`), and no `id` may appear twice. A broken rule gets **400** `INVALID_ITEM`. `ExpenseService` checks these rules, not the controller, so no caller can store a rounded or duplicated item. The controller only checks the JSON: one array whose items have no fields besides `id`, `description` and `amount` (a `tax_amount` isn't silently dropped), else **400** `INVALID_BODY`. `amount` can be sent as `"6.60"` or `6.60`; both are read exactly. An empty list `[]` is valid input, but it only reconciles if the taxes alone equal the total, so in practice it gets a 409. |
 | Reconcile | Check that the sum of the items plus the sum of `expense_tax.tax_amount` equals `expense.total` (§4) |
 | ❌ Doesn't reconcile | Return **409** and write **nothing**. Example below. |
 | ✅ Reconciles | One transaction; see the next table |
@@ -548,20 +550,20 @@ Re-itemize recomputes the status from scratch, so it can move an expense from an
 
 **Logs.** Go's `slog` writes `key=value` lines to standard error.
 
-- **One line per request**, e.g. `INFO request method=POST path=/receipts/…/process route="POST /receipts/{id}/process" status=422 duration_ms=3`. The level follows the status: INFO below 400, WARN for 4xx, ERROR for 5xx. `GET /metrics` is counted but not logged.
-- **One line per business event**, written once the event is saved:
+- **One line per request**, e.g. `INFO request method=POST path=/receipts/…/process route="POST /receipts/{id}/process" status=422 duration_ms=3`. The level follows the status: INFO below 400, WARN for 4xx, ERROR for 5xx. A client that leaves before its answer is written (for example during OCR) is logged and counted as 499, nginx's "client closed request"; nothing is sent. `GET /metrics` is counted but not logged.
+- **One line per business event.** A change is logged once it is saved. An OCR failure is logged as soon as it happens, so its cause is kept even if saving the failure fails too.
 
 | Event | Level | Fields |
 |---|---|---|
 | receipt processed | INFO | `receipt_id`, `transaction_id`, `itemize_status` |
 | receipt failed a guard | WARN | `receipt_id`, `code`, `reason` |
 | OCR failed | WARN | `receipt_id`, `error` |
-| mock OCR fallback (unknown file name) | INFO | `file_name` |
+| mock OCR fallback (unknown file name) | INFO | `file_name`, `fallback` |
 | items replaced by a PATCH | INFO | `transaction_id`, `items` |
 | PATCH refused: the items don't add up | WARN | `transaction_id`, `expected`, `actual`, `difference` |
 | transaction re-itemized | INFO | `transaction_id`, `itemize_status` |
 | write conflict | WARN | `method`, `path` |
-| unexpected error, panic | ERROR | `method`, `path`, `error` or `stack` (the client only sees `internal error`) |
+| unexpected error, panic | ERROR | `method`, `path`, and `error`, or `panic` and `stack` (the client only sees `internal error`) |
 
 **Metrics.** `GET /metrics` serves them in the Prometheus text format, on `127.0.0.1` like the rest of the API. You can read them with curl, or graph them with a local Prometheus + Grafana or Grafana Cloud's free tier. Labels are route patterns and fixed codes, never ids.
 
