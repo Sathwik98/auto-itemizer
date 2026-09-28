@@ -429,6 +429,83 @@ func TestPatchItems(t *testing.T) {
 	}
 }
 
+// TestPatchItemsSplit splits one item into two (ARCHITECTURE.md §3.6). The
+// split item's row is soft-deleted, the parts come after the unchanged items,
+// and the parts must still add up.
+func TestPatchItemsSplit(t *testing.T) {
+	s, d := setup(t)
+	e := create(t, s, d, readFixture(t, "receipt-clean"))
+	espresso, sandwich, water := e.LineItems[0], e.LineItems[1], e.LineItems[2]
+
+	// Bread 5.00 + Cheese 3.00 is 0.90 short of the Sandwich's 8.90. Nothing is written.
+	before := summary(mustGet(t, s, e.ID))
+	_, err := s.PatchItems(ctx, e.ID, []core.ItemInput{keep(espresso),
+		{Description: "Bread", Amount: dec("5.00")}, {Description: "Cheese", Amount: dec("3.00")}, keep(water)})
+	var mismatch *core.MismatchError
+	if !errors.As(err, &mismatch) || mismatch.Difference.StringFixed(2) != "0.90" {
+		t.Fatalf("uneven split: %v, want a mismatch of 0.90", err)
+	}
+	if after := summary(mustGet(t, s, e.ID)); after != before {
+		t.Errorf("a refused split wrote:\n%s", after)
+	}
+
+	// Bread 5.00 + Cheese 3.90 = 8.90.
+	got, err := s.PatchItems(ctx, e.ID, []core.ItemInput{keep(espresso),
+		{Description: "Bread", Amount: dec("5.00")}, {Description: "Cheese", Amount: dec("3.90")}, keep(water)})
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	var names []string
+	for _, item := range got.LineItems {
+		names = append(names, item.Description)
+	}
+	if got.ItemizationStatus != core.StatusComplete || !slices.Equal(names, []string{"Espresso", "Mineral water", "Bread", "Cheese"}) ||
+		got.LineItems[0].ID != espresso.ID || got.LineItems[1].ID != water.ID {
+		t.Errorf("after the split: %s; want Espresso and Mineral water kept, then Bread and Cheese", summary(got))
+	}
+	if deleted := queryString(t, d, `SELECT is_deleted FROM expense_line_item WHERE id = ?`, sandwich.ID); deleted != "1" {
+		t.Errorf("the Sandwich row is_deleted = %s, want 1 (its history is kept)", deleted)
+	}
+	if n := count(t, d, `SELECT count(*) FROM expense_line_item WHERE expense_id = ?`, e.ID); n != 5 {
+		t.Errorf("%d item rows, want 5: the 3 original ones and the 2 parts", n)
+	}
+}
+
+// TestPatchItemsEditAmounts changes amounts: each edited item gets a new row,
+// and a negative amount (a discount) is allowed while the total still matches.
+func TestPatchItemsEditAmounts(t *testing.T) {
+	s, d := setup(t)
+	e := create(t, s, d, readFixture(t, "receipt-clean"))
+	espresso, sandwich, water := e.LineItems[0], e.LineItems[1], e.LineItems[2]
+
+	// Move 0.50 from Espresso to Mineral water: 3.00 + 8.90 + 3.10 = 15.00.
+	got, err := s.PatchItems(ctx, e.ID, []core.ItemInput{
+		{ID: espresso.ID, Description: "Espresso", Amount: dec("3.00")},
+		keep(sandwich),
+		{ID: water.ID, Description: "Mineral water", Amount: dec("3.10")},
+	})
+	if err != nil {
+		t.Fatalf("edit amounts: %v", err)
+	}
+	if got.ItemizationStatus != core.StatusComplete || len(got.LineItems) != 3 || got.LineItems[0].ID != sandwich.ID ||
+		got.LineItems[1].ID == espresso.ID || !got.LineItems[1].Amount.Equal(dec("3.00")) ||
+		got.LineItems[2].ID == water.ID || !got.LineItems[2].Amount.Equal(dec("3.10")) {
+		t.Fatalf("after editing amounts: %s; want Sandwich kept, then the two edited items with new ids", summary(got))
+	}
+
+	// A discount line: 8.90 + 3.00 + 3.60 - 0.50 = 15.00.
+	got, err = s.PatchItems(ctx, e.ID, []core.ItemInput{keep(got.LineItems[0]), keep(got.LineItems[1]),
+		{ID: got.LineItems[2].ID, Description: "Mineral water", Amount: dec("3.60")},
+		{Description: "Discount", Amount: dec("-0.50")}})
+	if err != nil || got.ItemizationStatus != core.StatusComplete || len(got.LineItems) != 4 ||
+		!got.LineItems[3].Amount.Equal(dec("-0.50")) {
+		t.Errorf("discount line: %v, %s; want COMPLETE with a -0.50 item", err, summary(got))
+	}
+	if n := count(t, d, `SELECT count(*) FROM expense_line_item WHERE expense_id = ? AND is_deleted = 0`, e.ID); n != 4 {
+		t.Errorf("%d active item rows, want 4", n)
+	}
+}
+
 func TestPatchItemsRejectsInvalidItems(t *testing.T) {
 	s, d := setup(t)
 	e := create(t, s, d, readFixture(t, "receipt-mismatch"))

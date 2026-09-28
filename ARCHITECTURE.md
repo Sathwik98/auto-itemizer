@@ -56,7 +56,7 @@ The receipt parser returns `ParsedReceipt { merchant, date, currency, total, sub
 
 ### 1.2 OCR mode (`MOCK_OCR`)
 
-`OcrService` picks its provider at startup from `MOCK_OCR`. Upload works the same way in both modes: the file is always stored and a receipt is created. `MOCK_OCR` only changes where the OCR text comes from during `process`.
+`OcrService` picks its provider at startup from `MOCK_OCR`, which defaults to `true`. Upload works the same way in both modes: the file is always stored and a receipt is created. `MOCK_OCR` only changes where the OCR text comes from during `process`.
 
 | `MOCK_OCR` | Provider inside `OcrService` | Behaviour |
 |---|---|---|

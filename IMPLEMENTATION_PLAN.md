@@ -72,6 +72,17 @@ auto-itemizer/
   - From elsewhere it gets a `<feature><layer>` nickname, e.g. `expenseservice`, `fileuploadcore` or `receiptserver`.
   - Packages with unique names (`parser`, `ocr`, `db`, `models`, `respond`) keep them.
 
+**Settings** (`internal/config`). All are optional. An empty variable counts as unset, and a bad value stops the program with a message naming the variable.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `8080` | Port to listen on, on `127.0.0.1` only: the API has no login, so only this machine can connect |
+| `STORAGE_DIR` | `storage` | Uploaded files go to `<STORAGE_DIR>/receipts/` |
+| `DB_PATH` | `<STORAGE_DIR>/auto-itemizer.db` | The SQLite file, created with its folder |
+| `FIXTURES_DIR` | `fixtures` | The mock OCR reads `<FIXTURES_DIR>/task-a/` and `<FIXTURES_DIR>/mock-ocr/` |
+| `MOCK_OCR` | `true` | `false` selects the live provider, so `process` returns 501 |
+| `MOCK_OCR_FALLBACK` | `<FIXTURES_DIR>/task-a/receipt-clean.txt` | The text used when no fixture matches the uploaded file's name (ARCHITECTURE.md §1.2) |
+
 ---
 
 ## 3. Storage details
@@ -112,6 +123,8 @@ The folder must exist before the server starts, because the mock provider fails 
 - **Layout test** (`internal/layout`): reads every package's imports with Go's `go/build` and fails if a feature's `repository` is imported from outside the feature, or a `core` package imports database code (§2).
 - **API tests** use `httptest` against a temporary SQLite database. They cover upload → process → get for the three fixtures, re-itemize, `PATCH` returning 409 and 200, reprocessing, every guard fixture, the mock fallback (an unknown file name gets the gold text), upload errors (400, 413, 415), 404 for unknown and soft-deleted ids, 501 with `MOCK_OCR=false`, `GET /receipts/{id}` after a failure and after reprocessing, and `GET /health`. They also cover the `PATCH` body errors (`INVALID_BODY`, `INVALID_ITEM`, `UNKNOWN_ITEM`), the JSON 404 and 405 for an unknown path or a wrong method, a panic or unexpected error becoming a generic 500, and every amount in a response having exactly two decimals.
 - **Service tests** cover what the API can't trigger: `OCR_FAILED` with a fake OCR provider that returns an error, and `409 CONFLICT` with a stale `updated_at`.
+- **PATCH overrides** are tested in the service and through the API: split, merge and edit (including a discount line), each refused when the items stop adding up. Uploads are tested with PNG, JPEG and PDF.
+- **Database tests:** the schema applies twice without harm, every table and index exists by name, and the tax-name seed appears once.
 
 ---
 
@@ -130,8 +143,8 @@ Components are built bottom-up, in import order: a package is built after the pa
 | ReceiptService (upload, process, status, `getParsedReceipt`), one repository file per table | `internal/receipt/{core,repository,service}` | done |
 | Controllers (ReceiptController, ExpenseController) | `internal/receipt/server`, `internal/expense/server`, `internal/httpapi` (router, `models`, `respond`) | done |
 | Feature-first folders and the layout test (§2), on branch `refactor_feature_folders` | all of `internal/` | done |
-| Config and startup (wiring, graceful shutdown) | `cmd/server`, `internal/config` | next |
-| README with curls | — | to do |
+| Config and startup (wiring, graceful shutdown) | `cmd/server`, `internal/config` | done |
+| README with curls | — | next |
 
 **Notes for later components** (from the review on 2026-09-27):
 - **ReceiptService (done):**
@@ -156,4 +169,14 @@ Components are built bottom-up, in import order: a package is built after the pa
   - `TaxNames` returns the `tax_master` names.
   - Rates are stored exactly.
   - `FAILED` is reserved, because the stub parser never fails.
-- **Config and startup:** load the tax names once at startup with `expenses.TaxNames`, build the parser with `parser.New`, and pass it to ReceiptService. Build ExpenseService first (`expense.New`), then ReceiptService with it, then call `expenses.SetParsedReceiptSource(receipts)`: the two services need each other. To propose in that step's plan: refuse to start if the list is empty, because then no line would be read as a tax. `MOCK_OCR` defaults to `true`, so one command runs the service. `DB_PATH` needs a file default, because `db.Open` refuses an empty path (the SQLite driver would ignore the connection settings in §3) and `:memory:` (each pooled connection would get its own empty database). The OCR timeout passed to `ocr.New` is a constant in `main.go`, e.g. 30 s.
+- **Config and startup (done)**, in `cmd/server/main.go`:
+  - **Order:** the OCR provider is built first, so a wrong `FIXTURES_DIR` fails before any file is created. Then the database is opened, and ExpenseService is built. Its `TaxNames` feed `parser.New`, then ReceiptService is built, then `SetParsedReceiptSource` connects the two.
+  - **No tax names, no start.** It refuses to start if `tax_master` has no names, because then `VAT 19% 2.85` would be read as an item and the receipt could still come out `COMPLETE`.
+  - **Listening:** on `127.0.0.1` only, because the API has no login.
+  - **Timeouts:**
+    - OCR: 30 s.
+    - `ReadHeaderTimeout`: 5 s. `ReadTimeout`: 1 min.
+    - `WriteTimeout`: 2 min. It stays above the OCR timeout because it doesn't stop the handler.
+    - `IdleTimeout`: 2 min.
+  - **Shutdown:** Ctrl-C or SIGTERM drains the requests in flight for up to 10 s. `Shutdown` gets a fresh context, because the signal context is already cancelled.
+  - **`DB_PATH` needs a file path:** `db.Open` refuses an empty path and `:memory:` (§3).

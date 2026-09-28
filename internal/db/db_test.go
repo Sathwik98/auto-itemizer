@@ -140,6 +140,46 @@ func TestOpenAppliesSchemaAndSeedOnce(t *testing.T) {
 	}
 }
 
+// TestSchemaHasAllTables checks the tables and indexes of ARCHITECTURE.md §2
+// by name, so one missing from schema.sql is noticed here.
+func TestSchemaHasAllTables(t *testing.T) {
+	d, err := Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	names := func(kind string) []string {
+		t.Helper()
+		rows, err := d.QueryContext(ctx, `
+			SELECT name FROM sqlite_master
+			WHERE type = ? AND name NOT LIKE 'sqlite%' ORDER BY name`, kind) // skip SQLite's own
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var list []string
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			list = append(list, name)
+		}
+		return list
+	}
+
+	wantTables := []string{"expense", "expense_line_item", "expense_tax", "file_upload", "receipt_ocr", "receipts", "tax_master"}
+	if got := names("table"); !slices.Equal(got, wantTables) {
+		t.Errorf("tables = %v, want %v", got, wantTables)
+	}
+	// Two partial unique indexes (one active row per receipt) and two lookups by expense.
+	wantIndexes := []string{"expense_line_item_by_expense", "expense_one_active", "expense_tax_by_expense", "receipt_ocr_one_active"}
+	if got := names("index"); !slices.Equal(got, wantIndexes) {
+		t.Errorf("indexes = %v, want %v", got, wantIndexes)
+	}
+}
+
 func TestOpenRejectsPathsWithoutAFile(t *testing.T) {
 	// Run in an empty folder, so that if the check ever breaks, the stray
 	// database file lands there and not in the repository.

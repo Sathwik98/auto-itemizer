@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -363,6 +364,93 @@ func TestPatchAndReitemize(t *testing.T) {
 	res = send(t, h, http.MethodPost, "/transactions/"+id+"/itemize", "", nil)
 	if res.status != http.StatusOK || res.str("itemize_status") != expensecore.StatusNeedsReview || res.str("id") != id {
 		t.Errorf("re-itemize = %d %s", res.status, res.raw)
+	}
+}
+
+// lineItems returns the ids and descriptions of an expense response's items.
+func lineItems(res response) (ids, names []string) {
+	items, _ := res.body["line_items"].([]any)
+	for _, item := range items {
+		item, _ := item.(map[string]any)
+		id, _ := item["id"].(string)
+		name, _ := item["description"].(string)
+		ids = append(ids, id)
+		names = append(names, name)
+	}
+	return ids, names
+}
+
+// TestPatchEditMergeSplit runs the brief's three kinds of override (split,
+// merge and edit) through PATCH /transactions/{id}/items on receipt-clean.
+func TestPatchEditMergeSplit(t *testing.T) {
+	h := newAPI(t, nil)
+	processed := send(t, h, http.MethodPost, "/receipts/"+uploadFixture(t, h, "task-a", "receipt-clean")+"/process", "", nil)
+	transaction := "/transactions/" + processed.str("id")
+
+	// patch sends a list that reconciles and checks the items that come back,
+	// in order: unchanged items first, then changed and new ones.
+	patch := func(what, body string, want ...string) []string {
+		t.Helper()
+		res := sendJSON(t, h, http.MethodPatch, transaction+"/items", body)
+		if res.status != http.StatusOK || res.str("itemize_status") != expensecore.StatusComplete {
+			t.Fatalf("%s = %d %s", what, res.status, res.raw)
+		}
+		checkMoney(t, what, res.body)
+		ids, names := lineItems(res)
+		if !slices.Equal(names, want) {
+			t.Errorf("%s: items %v, want %v", what, names, want)
+		}
+		return ids
+	}
+
+	// Split: the Sandwich (8.90) becomes Bread 5.00 and Cheese 3.90.
+	ids, _ := lineItems(processed) // Espresso, Sandwich, Mineral water
+	ids = patch("split", fmt.Sprintf(
+		`[{"id":%q,"description":"Espresso","amount":"3.50"},{"description":"Bread","amount":"5.00"},{"description":"Cheese","amount":"3.90"},{"id":%q,"description":"Mineral water","amount":"2.60"}]`,
+		ids[0], ids[2]), "Espresso", "Mineral water", "Bread", "Cheese")
+
+	// Merge: Bread and Cheese become one line again.
+	ids = patch("merge", fmt.Sprintf(
+		`[{"id":%q,"description":"Espresso","amount":"3.50"},{"id":%q,"description":"Mineral water","amount":"2.60"},{"description":"Sandwich","amount":"8.90"}]`,
+		ids[0], ids[1]), "Espresso", "Mineral water", "Sandwich")
+
+	// Edit: move 0.50 from Espresso to Mineral water. Sandwich is unchanged, so it comes first.
+	ids = patch("edit", fmt.Sprintf(
+		`[{"id":%q,"description":"Espresso","amount":"3.00"},{"id":%q,"description":"Mineral water","amount":"3.10"},{"id":%q,"description":"Sandwich","amount":"8.90"}]`,
+		ids[0], ids[1], ids[2]), "Sandwich", "Espresso", "Mineral water")
+
+	// A split whose parts are 0.90 short is refused, and nothing changes.
+	before := send(t, h, http.MethodGet, transaction, "", nil)
+	res := sendJSON(t, h, http.MethodPatch, transaction+"/items", fmt.Sprintf(
+		`[{"id":%q,"description":"Espresso","amount":"3.00"},{"id":%q,"description":"Mineral water","amount":"3.10"},{"description":"Bread","amount":"5.00"},{"description":"Cheese","amount":"3.00"}]`,
+		ids[1], ids[2]))
+	wantError(t, "uneven split", res, http.StatusConflict, "ITEMS_DO_NOT_RECONCILE")
+	if res.str("difference") != "0.90" {
+		t.Errorf("uneven split difference = %s, want 0.90", res.raw)
+	}
+	if after := send(t, h, http.MethodGet, transaction, "", nil); after.raw != before.raw {
+		t.Errorf("a refused PATCH changed the transaction:\n%s\nwant\n%s", after.raw, before.raw)
+	}
+}
+
+// TestUploadImagesAndPDF: POST /receipts takes an image or a PDF (the brief),
+// and GET /receipts/{id} reports the type that was sent.
+func TestUploadImagesAndPDF(t *testing.T) {
+	h := newAPI(t, nil)
+	for name, contentType := range map[string]string{
+		"receipt.png": "image/png",
+		"receipt.jpg": "image/jpeg",
+		"receipt.pdf": "application/pdf",
+	} {
+		res := upload(t, h, name, contentType, []byte("fake bytes"))
+		if res.status != http.StatusCreated {
+			t.Errorf("%s: upload = %d %s, want 201", name, res.status, res.raw)
+			continue
+		}
+		got := send(t, h, http.MethodGet, "/receipts/"+res.str("receipt_id"), "", nil)
+		if file, _ := got.body["file"].(map[string]any); file["content_type"] != contentType {
+			t.Errorf("%s: GET receipt = %s, want content_type %s", name, got.raw, contentType)
+		}
 	}
 }
 
