@@ -1,0 +1,11 @@
+MERCHANT: Poutine Palace
+DATE: 2026-03-14
+CURRENCY: CAD
+
+Poutine                    10.00
+Soft drink                  2.50
+
+Subtotal                   12.50
+GST 5%                      0.63
+QST 9.975%                  1.25
+TOTAL                      14.38

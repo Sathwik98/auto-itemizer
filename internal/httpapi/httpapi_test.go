@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +26,7 @@ import (
 	expenseservice "auto-itemizer/internal/expense/service"
 	fileuploadservice "auto-itemizer/internal/fileupload/service"
 	"auto-itemizer/internal/httpapi/respond"
+	"auto-itemizer/internal/metrics"
 	"auto-itemizer/internal/ocr"
 	receiptcore "auto-itemizer/internal/receipt/core"
 	"auto-itemizer/internal/receipt/core/parser"
@@ -454,6 +457,54 @@ func TestUploadImagesAndPDF(t *testing.T) {
 	}
 }
 
+// TestExtraFixtures runs our extra receipts in fixtures/mock-ocr, beyond the
+// brief's three: two taxes on one subtotal (Canada), CGST and SGST (India),
+// and a discount line.
+func TestExtraFixtures(t *testing.T) {
+	h := newAPI(t, nil)
+	cases := []struct {
+		fixture, merchant, currency, total string
+		taxes                              []string // "name rate taxable amount"; taxable is null when the receipt doesn't show it
+		items                              []string // "description amount"
+	}{
+		{"receipt-gst-qst", "Poutine Palace", "CAD", "14.38",
+			[]string{"GST 0.05 null 0.63", "QST 0.09975 null 1.25"},
+			[]string{"Poutine 10.00", "Soft drink 2.50"}},
+		{"receipt-cgst-sgst", "Chennai Tiffin House", "INR", "212.40",
+			[]string{"CGST 0.09 null 16.20", "SGST 0.09 null 16.20"},
+			[]string{"Masala dosa 120.00", "Filter coffee 60.00"}},
+		{"receipt-discount", "Schreibwaren Kiez", "EUR", "14.99",
+			[]string{"VAT 0.19 12.60 2.39"},
+			[]string{"Notebook 8.00", "Pen set 6.00", "Discount 10% -1.40"}},
+	}
+	for _, tc := range cases {
+		res := send(t, h, http.MethodPost, "/receipts/"+uploadFixture(t, h, "mock-ocr", tc.fixture)+"/process", "", nil)
+		if res.status != http.StatusOK {
+			t.Errorf("%s: process = %d %s", tc.fixture, res.status, res.raw)
+			continue
+		}
+		checkMoney(t, tc.fixture, res.body)
+
+		var taxes, items []string
+		for _, tax := range res.body["taxes"].([]any) {
+			tax := tax.(map[string]any)
+			taxable := "null"
+			if s, ok := tax["taxable_amount"].(string); ok {
+				taxable = s
+			}
+			taxes = append(taxes, fmt.Sprintf("%s %s %s %s", tax["name"], tax["rate"], taxable, tax["amount"]))
+		}
+		for _, item := range res.body["line_items"].([]any) {
+			item := item.(map[string]any)
+			items = append(items, fmt.Sprintf("%s %s", item["description"], item["amount"]))
+		}
+		if res.str("merchant") != tc.merchant || res.str("currency") != tc.currency || res.str("grand_total") != tc.total ||
+			res.str("itemize_status") != expensecore.StatusComplete || !slices.Equal(taxes, tc.taxes) || !slices.Equal(items, tc.items) {
+			t.Errorf("%s = %s\nwant %s %s %s, taxes %v, items %v, COMPLETE", tc.fixture, res.raw, tc.merchant, tc.currency, tc.total, tc.taxes, tc.items)
+		}
+	}
+}
+
 func TestReprocess(t *testing.T) {
 	h := newAPI(t, nil)
 	receiptID := uploadFixture(t, h, "task-a", "receipt-clean")
@@ -530,17 +581,179 @@ func TestMockFallback(t *testing.T) {
 	}
 }
 
+// captureLogs sends slog's output to a buffer until the test ends. The
+// default logger is global, so tests that use this must not run in parallel.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	return &buf
+}
+
+// wantLog fails the test unless the captured logs contain every part.
+func wantLog(t *testing.T, logs *bytes.Buffer, parts ...string) {
+	t.Helper()
+	for _, part := range parts {
+		if !strings.Contains(logs.String(), part) {
+			t.Errorf("the logs lack %q; they are:\n%s", part, logs.String())
+		}
+	}
+}
+
+// metricValue returns one series' value from /metrics, or 0 when the series
+// isn't there yet. Counters are process-wide, so tests compare before and
+// after.
+func metricValue(t *testing.T, series string) float64 {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if rest, ok := strings.CutPrefix(line, series+" "); ok {
+			v, err := strconv.ParseFloat(rest, 64)
+			if err != nil {
+				t.Fatalf("%s: %v", line, err)
+			}
+			return v
+		}
+	}
+	return 0
+}
+
+// wantIncrease fails the test unless series went up by want since before.
+func wantIncrease(t *testing.T, series string, before, want float64) {
+	t.Helper()
+	if got := metricValue(t, series) - before; got != want {
+		t.Errorf("%s went up by %v, want %v", series, got, want)
+	}
+}
+
 func TestInternalErrorsDontLeak(t *testing.T) {
+	before := metricValue(t, "internal_errors_total")
 	rec := httptest.NewRecorder()
 	respond.WriteError(rec, httptest.NewRequest(http.MethodGet, "/x", nil), errors.New("sqlite: disk I/O error at /secret/path"))
 	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "secret") ||
 		!strings.Contains(rec.Body.String(), "INTERNAL_ERROR") {
 		t.Errorf("unexpected error = %d %s; want a generic 500", rec.Code, rec.Body.String())
 	}
+	wantIncrease(t, "internal_errors_total", before, 1)
 }
 
+// A write conflict is answered with 409, counted and logged.
+func TestWriteConflictIsCountedAndLogged(t *testing.T) {
+	logs := captureLogs(t)
+	before := metricValue(t, "write_conflicts_total")
+	rec := httptest.NewRecorder()
+	respond.WriteError(rec, httptest.NewRequest(http.MethodPatch, "/transactions/t1/items", nil), fmt.Errorf("save: %w", db.ErrConflict))
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"CONFLICT"`) {
+		t.Errorf("conflict = %d %s, want 409 CONFLICT", rec.Code, rec.Body.String())
+	}
+	wantIncrease(t, "write_conflicts_total", before, 1)
+	wantLog(t, logs, `level=WARN msg="write conflict" method=PATCH path=/transactions/t1/items`)
+}
+
+// A panic is answered with a JSON 500, counted, and its request logged at ERROR.
 func TestPanicBecomesJSON500(t *testing.T) {
-	h := recoverPanics(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { panic("boom") }))
+	logs := captureLogs(t)
+	before := metricValue(t, "panics_total")
+	h := logRequests(recoverPanics(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { panic("boom") })))
 	res := send(t, h, http.MethodGet, "/", "", nil)
 	wantError(t, "panic", res, http.StatusInternalServerError, "INTERNAL_ERROR")
+	wantIncrease(t, "panics_total", before, 1)
+	wantLog(t, logs, `level=ERROR msg="panic in handler"`,
+		`level=ERROR msg=request method=GET path=/ route=unmatched status=500`)
+}
+
+// Every request gets one log line with the level set by its status, and is
+// counted by route and status. GET /metrics is counted but not logged.
+func TestRequestLogAndMetrics(t *testing.T) {
+	h := newAPI(t, nil)
+	logs := captureLogs(t)
+	health := `http_requests_total{route="GET /health",status="200"}`
+	unknown := `http_requests_total{route="unmatched",status="404"}`
+	healthBefore, unknownBefore := metricValue(t, health), metricValue(t, unknown)
+
+	send(t, h, http.MethodGet, "/health", "", nil)
+	send(t, h, http.MethodGet, "/no/such/path", "", nil)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	wantIncrease(t, health, healthBefore, 1)
+	wantIncrease(t, unknown, unknownBefore, 1)
+	wantLog(t, logs,
+		`level=INFO msg=request method=GET path=/health route="GET /health" status=200 duration_ms=`,
+		`level=WARN msg=request method=GET path=/no/such/path route=unmatched status=404`)
+	if strings.Contains(logs.String(), "path=/metrics") {
+		t.Errorf("GET /metrics was logged:\n%s", logs.String())
+	}
+}
+
+// GET /metrics answers in the Prometheus text format and lists every metric.
+func TestMetricsEndpoint(t *testing.T) {
+	h := newAPI(t, nil)
+	send(t, h, http.MethodGet, "/health", "", nil) // so the request metrics have a series
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/plain") {
+		t.Fatalf("GET /metrics = %d, Content-Type %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	for _, name := range []string{"http_requests_total", "http_request_duration_seconds", "receipt_outcomes_total",
+		"mock_ocr_fallbacks_total", "patches_refused_total", "write_conflicts_total", "internal_errors_total", "panics_total"} {
+		if !strings.Contains(rec.Body.String(), "# TYPE "+name+" ") {
+			t.Errorf("/metrics lacks %s", name)
+		}
+	}
+}
+
+// Each processed receipt is logged and counted by its outcome. An unknown
+// file name also counts a mock fallback.
+func TestReceiptOutcomesAreLoggedAndCounted(t *testing.T) {
+	h := newAPI(t, nil)
+	logs := captureLogs(t)
+	outcome := func(name string) string { return `receipt_outcomes_total{outcome="` + name + `"}` }
+	complete, review, letter := metricValue(t, outcome("COMPLETE")), metricValue(t, outcome("NEEDS_REVIEW")), metricValue(t, outcome("NOT_A_RECEIPT"))
+	fallbacks := metricValue(t, "mock_ocr_fallbacks_total")
+	process := func(receiptID string) response {
+		return send(t, h, http.MethodPost, "/receipts/"+receiptID+"/process", "", nil)
+	}
+
+	clean := uploadFixture(t, h, "task-a", "receipt-clean")
+	cleanTransaction := process(clean).str("id")
+	process(uploadFixture(t, h, "task-a", "receipt-mismatch"))
+	notReceipt := uploadFixture(t, h, "mock-ocr", "not-a-receipt")
+	process(notReceipt)
+	process(upload(t, h, "photo.png", "image/png", []byte("fake png bytes")).str("receipt_id")) // falls back to receipt-clean
+
+	wantIncrease(t, outcome("COMPLETE"), complete, 2) // receipt-clean and the fallback
+	wantIncrease(t, outcome("NEEDS_REVIEW"), review, 1)
+	wantIncrease(t, outcome("NOT_A_RECEIPT"), letter, 1)
+	wantIncrease(t, "mock_ocr_fallbacks_total", fallbacks, 1)
+	wantLog(t, logs,
+		`level=INFO msg="receipt processed" receipt_id=`+clean+` transaction_id=`+cleanTransaction+` itemize_status=COMPLETE`,
+		`level=WARN msg="receipt failed a guard" receipt_id=`+notReceipt+` code=NOT_A_RECEIPT reason=`,
+		`msg="mock OCR: no fixture matches the uploaded name, using the fallback" file_name=photo.png`)
+}
+
+// A refused PATCH is counted and logged with its numbers. An accepted PATCH
+// and a re-itemize are logged too.
+func TestPatchEventsAreLoggedAndCounted(t *testing.T) {
+	h := newAPI(t, nil)
+	logs := captureLogs(t)
+	refused := metricValue(t, "patches_refused_total")
+	processed := send(t, h, http.MethodPost, "/receipts/"+uploadFixture(t, h, "task-a", "receipt-mismatch")+"/process", "", nil)
+	id := processed.str("id")
+	ids, _ := lineItems(processed)
+	path := "/transactions/" + id + "/items"
+
+	sendJSON(t, h, http.MethodPatch, path, fmt.Sprintf(
+		`[{"id":%q,"description":"Water","amount":"4.00"},{"id":%q,"description":"Snacks","amount":"6.00"}]`, ids[0], ids[1]))
+	sendJSON(t, h, http.MethodPatch, path, fmt.Sprintf(
+		`[{"id":%q,"description":"Water","amount":"4.00"},{"id":%q,"description":"Snacks","amount":"6.00"},{"description":"Minibar","amount":"6.60"}]`, ids[0], ids[1]))
+	send(t, h, http.MethodPost, "/transactions/"+id+"/itemize", "", nil)
+
+	wantIncrease(t, "patches_refused_total", refused, 1)
+	wantLog(t, logs,
+		`level=WARN msg="PATCH refused: the items don't add up" transaction_id=`+id+` expected=18.50 actual=11.90 difference=6.60`,
+		`level=INFO msg="items replaced by a PATCH" transaction_id=`+id+` items=3`,
+		`level=INFO msg="transaction re-itemized" transaction_id=`+id+` itemize_status=NEEDS_REVIEW`)
 }

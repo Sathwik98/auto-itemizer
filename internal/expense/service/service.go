@@ -9,10 +9,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"auto-itemizer/internal/db"
 	"auto-itemizer/internal/expense/core"
 	"auto-itemizer/internal/expense/repository"
+	"auto-itemizer/internal/metrics"
 	"auto-itemizer/internal/receipt/core/parser"
 
 	"github.com/google/uuid"
@@ -150,7 +152,12 @@ func (s *Service) Reitemize(ctx context.Context, id string) (core.Expense, error
 		return core.Expense{}, fmt.Errorf("re-itemize expense %s: %w", id, err)
 	}
 	lines, status := core.Itemize(parsed.CandidateLines, core.TaxAmounts(e.Taxes), e.Total)
-	return s.saveReitemize(ctx, e, lines, status)
+	out, err := s.saveReitemize(ctx, e, lines, status)
+	if err != nil {
+		return core.Expense{}, err
+	}
+	slog.Info("transaction re-itemized", "transaction_id", id, "itemize_status", out.ItemizationStatus)
+	return out, nil
 }
 
 // saveReitemize writes a re-itemize result for e, as read by Reitemize.
@@ -196,9 +203,18 @@ func (s *Service) PatchItems(ctx context.Context, id string, items []core.ItemIn
 		amounts[i] = item.Amount
 	}
 	if mismatch := core.Reconcile(amounts, core.TaxAmounts(e.Taxes), e.Total); mismatch != nil {
+		slog.Warn("PATCH refused: the items don't add up", "transaction_id", id,
+			"expected", mismatch.Expected.StringFixed(2), "actual", mismatch.Actual.StringFixed(2),
+			"difference", mismatch.Difference.StringFixed(2))
+		metrics.RecordPatchRefused()
 		return core.Expense{}, mismatch
 	}
-	return s.savePatch(ctx, e, items)
+	out, err := s.savePatch(ctx, e, items)
+	if err != nil {
+		return core.Expense{}, err
+	}
+	slog.Info("items replaced by a PATCH", "transaction_id", id, "items", len(out.LineItems))
+	return out, nil
 }
 
 // checkItems applies the PATCH rules: every id is an active item of e and

@@ -3,8 +3,11 @@ package service
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +17,7 @@ import (
 	expenseservice "auto-itemizer/internal/expense/service"
 	fileuploadcore "auto-itemizer/internal/fileupload/core"
 	fileuploadservice "auto-itemizer/internal/fileupload/service"
+	"auto-itemizer/internal/metrics"
 	"auto-itemizer/internal/ocr"
 	"auto-itemizer/internal/receipt/core"
 	"auto-itemizer/internal/receipt/core/parser"
@@ -23,6 +27,26 @@ import (
 )
 
 var ctx = context.Background()
+
+// outcomeCount returns receipt_outcomes_total for one outcome, read from
+// /metrics. Counters are process-wide, so tests compare before and after.
+func outcomeCount(t *testing.T, outcome string) float64 {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	series := `receipt_outcomes_total{outcome="` + outcome + `"} `
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if rest, ok := strings.CutPrefix(line, series); ok {
+			v, err := strconv.ParseFloat(rest, 64)
+			if err != nil {
+				t.Fatalf("%s: %v", line, err)
+			}
+			return v
+		}
+	}
+	t.Fatalf("/metrics has no %s series", outcome)
+	return 0
+}
 
 func fixturePath(parts ...string) string {
 	return filepath.Join(append([]string{"..", "..", "..", "fixtures"}, parts...)...)
@@ -262,9 +286,13 @@ func TestProcessOCRFailed(t *testing.T) {
 	first := e.process(t, r.ID)
 
 	failing := e.withOCR(fakeProvider{err: errors.New("vendor down")}, time.Second)
+	counted := outcomeCount(t, core.CodeOCRFailed)
 	_, err := failing.Process(ctx, r.ID)
 	if got := codeOf(t, err); got != core.CodeOCRFailed {
 		t.Fatalf("code %q, want OCR_FAILED", got)
+	}
+	if got := outcomeCount(t, core.CodeOCRFailed) - counted; got != 1 {
+		t.Errorf("the OCR_FAILED outcome went up by %v, want 1", got)
 	}
 	d := e.details(t, r.ID)
 	if d.Status != core.StatusFailed || d.FailureReason != core.CodeOCRFailed || d.ExpenseID != "" {
@@ -421,6 +449,14 @@ func TestSaveWithStaleReceiptConflicts(t *testing.T) {
 
 	if _, err := e.receipts.saveOCR(ctx, stale, "TOTAL 1.00"); !errors.Is(err, db.ErrConflict) {
 		t.Errorf("saveOCR with a stale receipt: %v, want db.ErrConflict", err)
+	}
+	// An outcome is counted only once its save succeeds.
+	counted := outcomeCount(t, core.CodeNotAReceipt)
+	if err := e.receipts.saveGuardFailure(ctx, stale, &core.GuardError{Code: core.CodeNotAReceipt, Message: "test"}); !errors.Is(err, db.ErrConflict) {
+		t.Errorf("saveGuardFailure with a stale receipt: %v, want db.ErrConflict", err)
+	}
+	if got := outcomeCount(t, core.CodeNotAReceipt) - counted; got != 0 {
+		t.Errorf("a conflicting guard failure was counted (%v), want 0", got)
 	}
 	after := e.details(t, r.ID)
 	if after.Receipt != before.Receipt || after.ExpenseID != before.ExpenseID {

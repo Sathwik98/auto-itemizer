@@ -1,0 +1,11 @@
+MERCHANT: Chennai Tiffin House
+DATE: 2026-03-15
+CURRENCY: INR
+
+Masala dosa               120.00
+Filter coffee              60.00
+
+Subtotal                  180.00
+CGST @ 9%                  16.20
+SGST @ 9%                  16.20
+TOTAL                     212.40

@@ -60,7 +60,7 @@ The receipt parser returns `ParsedReceipt { merchant, date, currency, total, sub
 
 | `MOCK_OCR` | Provider inside `OcrService` | Behaviour |
 |---|---|---|
-| `true` | `MockOcrProvider` | 1. Take the stem of `file_upload.file_name`, e.g. `receipt-clean.png` → `receipt-clean`.<br>2. If mock OCR data exists under that name (`fixtures/task-a/<stem>.txt`, or our extra guard fixtures in `fixtures/mock-ocr/<stem>.txt`), return it as `raw_text`.<br>3. Otherwise **fall back to the gold OCR text**: `fixtures/task-a/receipt-clean.txt`, which can be changed with `MOCK_OCR_FALLBACK`. The fallback is logged. |
+| `true` | `MockOcrProvider` | 1. Take the stem of `file_upload.file_name`, e.g. `receipt-clean.png` → `receipt-clean`.<br>2. If mock OCR data exists under that name (`fixtures/task-a/<stem>.txt`, or our extra fixtures in `fixtures/mock-ocr/<stem>.txt`), return it as `raw_text`.<br>3. Otherwise **fall back to the gold OCR text**: `fixtures/task-a/receipt-clean.txt`, which can be changed with `MOCK_OCR_FALLBACK`. The fallback is logged. |
 | `false` | `LiveOcrProvider` | Calls a real OCR vendor. **Out of scope for now.** `process` returns **501** `LIVE_OCR_NOT_CONFIGURED` before writing anything. |
 
 ### 1.3 Guards
@@ -183,6 +183,7 @@ There is one row per tax per rate, and zero rows when the receipt prints no tax.
 - **Unknown id** in a path: **404** `NOT_FOUND`. A soft-deleted expense counts as unknown.
 - **Two requests at once** on the same receipt or expense (`process`, `itemize`, `PATCH`): the write is conditional on the row's `updated_at` being the value read at the start (`UPDATE … WHERE id = ? AND updated_at = ?`). If another request got there first, zero rows match, the whole transaction rolls back and the response is **409** `CONFLICT`. The client can retry. The partial unique indexes back this up at the database level.
 - **`GET /health`** → `200 { "status": "ok" }`.
+- **`GET /metrics`** → the Prometheus metrics (§3.8). Every request also writes one log line.
 
 **Error codes**
 
@@ -542,6 +543,40 @@ stateDiagram-v2
 ```
 
 Re-itemize recomputes the status from scratch, so it can move an expense from any status to any other.
+
+### 3.8 Observability: logs and metrics
+
+**Logs.** Go's `slog` writes `key=value` lines to standard error.
+
+- **One line per request**, e.g. `INFO request method=POST path=/receipts/…/process route="POST /receipts/{id}/process" status=422 duration_ms=3`. The level follows the status: INFO below 400, WARN for 4xx, ERROR for 5xx. `GET /metrics` is counted but not logged.
+- **One line per business event**, written once the event is saved:
+
+| Event | Level | Fields |
+|---|---|---|
+| receipt processed | INFO | `receipt_id`, `transaction_id`, `itemize_status` |
+| receipt failed a guard | WARN | `receipt_id`, `code`, `reason` |
+| OCR failed | WARN | `receipt_id`, `error` |
+| mock OCR fallback (unknown file name) | INFO | `file_name` |
+| items replaced by a PATCH | INFO | `transaction_id`, `items` |
+| PATCH refused: the items don't add up | WARN | `transaction_id`, `expected`, `actual`, `difference` |
+| transaction re-itemized | INFO | `transaction_id`, `itemize_status` |
+| write conflict | WARN | `method`, `path` |
+| unexpected error, panic | ERROR | `method`, `path`, `error` or `stack` (the client only sees `internal error`) |
+
+**Metrics.** `GET /metrics` serves them in the Prometheus text format, on `127.0.0.1` like the rest of the API. You can read them with curl, or graph them with a local Prometheus + Grafana or Grafana Cloud's free tier. Labels are route patterns and fixed codes, never ids.
+
+| Metric | Labels | What it counts |
+|---|---|---|
+| `http_requests_total` | `route`, `status` | Every request. `route` is the router's pattern, or `unmatched` for an unknown path. |
+| `http_request_duration_seconds` | `route` | A histogram of the time taken to answer |
+| `receipt_outcomes_total` | `outcome` | Each processed receipt: `COMPLETE`, `NEEDS_REVIEW`, or the code of the guard it failed. All start at 0. |
+| `mock_ocr_fallbacks_total` | — | Uploads whose name matched no fixture |
+| `patches_refused_total` | — | PATCHes refused with 409 `ITEMS_DO_NOT_RECONCILE` |
+| `write_conflicts_total` | — | Writes refused with 409 `CONFLICT` |
+| `internal_errors_total` | — | Unexpected errors answered with 500 |
+| `panics_total` | — | Handler panics turned into a 500 |
+
+Go's own `go_*` and `process_*` metrics are included too. An outcome is logged and counted only after it's saved, so the counts match the database.
 
 ---
 

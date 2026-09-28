@@ -13,13 +13,14 @@ This document covers **how the application is built**. [ARCHITECTURE.md](ARCHITE
 
 ## 2. Stack and project layout
 
-**Stack:** Go 1.25 or later, using only the standard library `net/http`, whose router handles methods and path parameters (`POST /receipts/{id}/process`). There are three dependencies:
+**Stack:** Go 1.25 or later, using only the standard library `net/http`, whose router handles methods and path parameters (`POST /receipts/{id}/process`). There are four dependencies:
 
 | Dependency | Why |
 |---|---|
 | `modernc.org/sqlite` | SQLite driver written in pure Go. It needs no CGO or C compiler, so one `go run` starts the service. |
 | `github.com/shopspring/decimal` | Exact decimal arithmetic for money and rates, never `float64` |
 | `github.com/google/uuid` | Ids and stored file names |
+| `github.com/prometheus/client_golang` | The official Prometheus client, behind `GET /metrics` (ARCHITECTURE.md §3.8). Only `internal/metrics` imports it. |
 
 ```
 auto-itemizer/
@@ -45,6 +46,7 @@ auto-itemizer/
 │   │   ├── core/             # FileUpload
 │   │   └── repository/       # SQL: file_upload
 │   ├── ocr/                  # OcrService (generic): Provider interface, MockProvider, LiveProvider ("not configured")
+│   ├── metrics/              # the Prometheus metrics and GET /metrics; the only package that imports Prometheus
 │   ├── layout/               # a test of the folder rules below
 │   └── db/                   # SQLite connection, embedded schema (.sql), transaction helper passed between services
 ├── fixtures/
@@ -114,6 +116,14 @@ The folder must exist before the server starts, because the mock provider fails 
 | `header-incomplete.txt` | Has a `TOTAL` line but no merchant or date | 422 `HEADER_INCOMPLETE` |
 | `invalid-values.txt` | e.g. total `0.00`, or tax larger than the total | 422 `INVALID_RECEIPT_VALUES` |
 
+**Extra receipts.** These go beyond the brief's three and also live in `fixtures/mock-ocr/`. They put receipt shapes that were only unit-tested within reach of curl. Each is checked field by field in the API tests (`TestExtraFixtures`).
+
+| File | Shape | Expected |
+|---|---|---|
+| `receipt-gst-qst.txt` | Canada: GST 5% and QST 9.975% on one subtotal | 200 `COMPLETE`; the QST rate is stored exactly (`0.09975`); both `taxable_amount`s are null, because the subtotal is shared |
+| `receipt-cgst-sgst.txt` | India: `CGST @ 9%` and `SGST @ 9%`, INR | 200 `COMPLETE`; two tax rows, CGST and SGST |
+| `receipt-discount.txt` | A `Discount 10%  -1.40` line before VAT | 200 `COMPLETE`; the discount is a line item with a negative amount; VAT's `taxable_amount` is the subtotal, 12.60 |
+
 ---
 
 ## 5. Tests
@@ -121,6 +131,13 @@ The folder must exist before the server starts, because the mock provider fails 
 - **Unit tests** for the pure functions: the parser in `receipt/core/parser`, the guards in `receipt/core`, itemize and reconcile in `expense/core`.
 - **Golden tests:** the parser's test compares each fixture's header, taxes and candidate lines with `gold.json`. The `expense/core` test runs each fixture through parse → itemize and compares the items and `itemize_status`. The guards are tested on the same fixtures in `receipt/core`.
 - **Layout test** (`internal/layout`): reads every package's imports with Go's `go/build` and fails if a feature's `repository` is imported from outside the feature, or a `core` package imports database code (§2).
+- **Observability tests** read the counters by scraping `/metrics` and the logs by swapping `slog`'s default logger. They cover:
+  - each request line and its level;
+  - `unmatched` for unknown paths;
+  - every receipt outcome, including `OCR_FAILED` through a failing OCR provider;
+  - that an outcome whose save hits a conflict isn't counted;
+  - refused and accepted PATCHes, write conflicts, internal errors and panics;
+  - an 11 MB upload over a real socket still getting its 413.
 - **API tests** use `httptest` against a temporary SQLite database. They cover upload → process → get for the three fixtures, re-itemize, `PATCH` returning 409 and 200, reprocessing, every guard fixture, the mock fallback (an unknown file name gets the gold text), upload errors (400, 413, 415), 404 for unknown and soft-deleted ids, 501 with `MOCK_OCR=false`, `GET /receipts/{id}` after a failure and after reprocessing, and `GET /health`. They also cover the `PATCH` body errors (`INVALID_BODY`, `INVALID_ITEM`, `UNKNOWN_ITEM`), the JSON 404 and 405 for an unknown path or a wrong method, a panic or unexpected error becoming a generic 500, and every amount in a response having exactly two decimals.
 - **Service tests** cover what the API can't trigger: `OCR_FAILED` with a fake OCR provider that returns an error, and `409 CONFLICT` with a stale `updated_at`.
 - **PATCH overrides** are tested in the service and through the API: split, merge and edit (including a discount line), each refused when the items stop adding up. Uploads are tested with PNG, JPEG and PDF.
@@ -144,6 +161,7 @@ Components are built bottom-up, in import order: a package is built after the pa
 | Controllers (ReceiptController, ExpenseController) | `internal/receipt/server`, `internal/expense/server`, `internal/httpapi` (router, `models`, `respond`) | done |
 | Feature-first folders and the layout test (§2), on branch `refactor_feature_folders` | all of `internal/` | done |
 | Config and startup (wiring, graceful shutdown) | `cmd/server`, `internal/config` | done |
+| Observability: a request log line, event logs, Prometheus metrics at `/metrics` (an extra, ARCHITECTURE.md §3.8) | `internal/metrics`, `internal/httpapi` | done |
 | README with curls | — | next |
 
 **Notes for later components** (from the review on 2026-09-27):

@@ -9,10 +9,12 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"time"
 
 	expenseserver "auto-itemizer/internal/expense/server"
 	expenseservice "auto-itemizer/internal/expense/service"
 	"auto-itemizer/internal/httpapi/respond"
+	"auto-itemizer/internal/metrics"
 	receiptserver "auto-itemizer/internal/receipt/server"
 	receiptservice "auto-itemizer/internal/receipt/service"
 )
@@ -36,6 +38,7 @@ func NewHandler(receipts *receiptservice.Service, expenses *expenseservice.Servi
 		{http.MethodPost, "/transactions/{id}/itemize", ec.Itemize},
 		{http.MethodPatch, "/transactions/{id}/items", ec.PatchItems},
 		{http.MethodGet, "/health", health},
+		{http.MethodGet, "/metrics", metrics.Handler().ServeHTTP}, // ARCHITECTURE.md §3.8
 	}
 
 	mux := http.NewServeMux()
@@ -48,8 +51,72 @@ func NewHandler(receipts *receiptservice.Service, expenses *expenseservice.Servi
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		respond.WriteProblem(w, http.StatusNotFound, "NOT_FOUND", "no such endpoint")
 	})
-	return recoverPanics(mux)
+	// logRequests is outside recoverPanics, so a panic's 500 is logged and
+	// counted like any other answer.
+	return logRequests(recoverPanics(mux))
 }
+
+// logRequests writes one log line per request and records it in the metrics
+// (ARCHITECTURE.md §3.8). The level follows the status: INFO below 400, WARN
+// for 4xx, ERROR for 5xx. GET /metrics is counted but not logged, because
+// Prometheus polls it.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+		duration := time.Since(start)
+
+		// The router sets r.Pattern to the route that matched, such as
+		// "POST /receipts/{id}/process". The catch-all "/" is an unknown path.
+		route := r.Pattern
+		if route == "" || route == "/" {
+			route = "unmatched"
+		}
+		status := rec.status
+		if status == 0 {
+			status = http.StatusOK // the handler wrote nothing
+		}
+		metrics.RecordRequest(route, status, duration)
+		if route == "GET /metrics" {
+			return
+		}
+
+		level := slog.LevelInfo
+		switch {
+		case status >= 500:
+			level = slog.LevelError
+		case status >= 400:
+			level = slog.LevelWarn
+		}
+		slog.Log(r.Context(), level, "request", "method", r.Method, "path", r.URL.Path,
+			"route", route, "status", status, "duration_ms", duration.Milliseconds())
+	})
+}
+
+// statusRecorder remembers the status code a handler sends, for the request
+// log and metrics.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK // a body without WriteHeader means 200
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.ResponseController reach the real writer.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
 // health handles GET /health.
 func health(w http.ResponseWriter, r *http.Request) {
@@ -81,6 +148,7 @@ func recoverPanics(next http.Handler) http.Handler {
 			}
 			slog.Error("panic in handler", "method", r.Method, "path", r.URL.Path,
 				"panic", p, "stack", string(debug.Stack()))
+			metrics.RecordPanic()
 			respond.WriteProblem(w, http.StatusInternalServerError, "INTERNAL_ERROR", "internal error")
 		}()
 		next.ServeHTTP(w, r)

@@ -16,6 +16,7 @@ import (
 	expenseservice "auto-itemizer/internal/expense/service"
 	fileuploadcore "auto-itemizer/internal/fileupload/core"
 	fileuploadservice "auto-itemizer/internal/fileupload/service"
+	"auto-itemizer/internal/metrics"
 	"auto-itemizer/internal/ocr"
 	"auto-itemizer/internal/receipt/core"
 	"auto-itemizer/internal/receipt/core/parser"
@@ -140,6 +141,7 @@ func (s *Service) saveOCRFailed(ctx context.Context, r core.Receipt, cause error
 	if err != nil {
 		return err
 	}
+	metrics.RecordReceiptOutcome(core.CodeOCRFailed)
 	return &core.GuardError{Code: core.CodeOCRFailed, Message: "the OCR call failed or timed out; process the receipt again to retry"}
 }
 
@@ -174,6 +176,8 @@ func (s *Service) saveGuardFailure(ctx context.Context, r core.Receipt, guardErr
 	if _, err := repository.UpdateStatus(ctx, s.db, r, core.StatusFailed, guardErr.Code); err != nil {
 		return err
 	}
+	slog.Warn("receipt failed a guard", "receipt_id", r.ID, "code", guardErr.Code, "reason", guardErr.Message)
+	metrics.RecordReceiptOutcome(guardErr.Code)
 	return guardErr
 }
 
@@ -192,6 +196,8 @@ func (s *Service) saveExpense(ctx context.Context, r core.Receipt, parsed parser
 	if err != nil {
 		return expensecore.Expense{}, err
 	}
+	slog.Info("receipt processed", "receipt_id", r.ID, "transaction_id", e.ID, "itemize_status", e.ItemizationStatus)
+	metrics.RecordReceiptOutcome(e.ItemizationStatus)
 	return e, nil
 }
 

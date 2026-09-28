@@ -13,6 +13,7 @@ import (
 	"auto-itemizer/internal/db"
 	expensecore "auto-itemizer/internal/expense/core"
 	"auto-itemizer/internal/httpapi/models"
+	"auto-itemizer/internal/metrics"
 	receiptcore "auto-itemizer/internal/receipt/core"
 )
 
@@ -56,6 +57,8 @@ func WriteError(w http.ResponseWriter, r *http.Request, err error) {
 			Difference: mismatch.Difference.StringFixed(2),
 		})
 	case errors.Is(err, db.ErrConflict):
+		slog.Warn("write conflict", "method", r.Method, "path", r.URL.Path)
+		metrics.RecordWriteConflict()
 		WriteProblem(w, http.StatusConflict, "CONFLICT", "another request changed this first; try again")
 	case errors.Is(err, expensecore.ErrUnknownItem):
 		WriteProblem(w, http.StatusBadRequest, "UNKNOWN_ITEM", err.Error())
@@ -64,6 +67,7 @@ func WriteError(w http.ResponseWriter, r *http.Request, err error) {
 	default:
 		// Log the details, but don't send internals to the client.
 		slog.Error("request failed", "method", r.Method, "path", r.URL.Path, "error", err)
+		metrics.RecordInternalError()
 		WriteProblem(w, http.StatusInternalServerError, "INTERNAL_ERROR", "internal error")
 	}
 }

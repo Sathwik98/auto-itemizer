@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -258,6 +259,48 @@ func TestServeFinishesRequestsInFlight(t *testing.T) {
 	}
 	if err := waitFor(t, done); err != nil {
 		t.Errorf("serve = %v, want nil after draining", err)
+	}
+}
+
+// A 12 MB upload over a real socket still gets its 413. The request log wraps
+// the response writer, which hides a hook http.MaxBytesReader uses, so this
+// checks the answer still arrives over a real connection (httptest's
+// recorder has none).
+func TestServeRefusesHugeUpload(t *testing.T) {
+	ln, _, _ := startServe(t, newTestHandler(t, testConfig(t)))
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", `form-data; name="file"; filename="huge.txt"`)
+	header.Set("Content-Type", "text/plain")
+	part, err := mw.CreatePart(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part.Write(bytes.Repeat([]byte("a"), 12<<20))
+	mw.Close()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Write while reading: the server answers before it has read the whole
+	// body, then stops reading, so the write may fail. That's expected.
+	go func() {
+		fmt.Fprintf(conn, "POST /receipts HTTP/1.1\r\nHost: localhost\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n",
+			mw.FormDataContentType(), body.Len())
+		conn.Write(body.Bytes())
+	}()
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("reading the answer: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", resp.StatusCode)
 	}
 }
 

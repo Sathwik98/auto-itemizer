@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	fileuploadcore "auto-itemizer/internal/fileupload/core"
+	"auto-itemizer/internal/metrics"
 )
 
 // MockProvider is used when MOCK_OCR=true (ARCHITECTURE.md §1.2). It returns
@@ -59,6 +60,7 @@ func (m *MockProvider) Extract(ctx context.Context, f fileuploadcore.FileUpload)
 	}
 	slog.Info("mock OCR: no fixture matches the uploaded name, using the fallback",
 		"file_name", f.FileName, "fallback", m.fallbackPath)
+	metrics.RecordMockOCRFallback()
 	return m.fallback, nil
 }
 
