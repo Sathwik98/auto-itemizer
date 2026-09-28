@@ -8,7 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"auto-itemizer/internal/fileupload"
+	fileuploadcore "auto-itemizer/internal/fileupload/core"
+	"auto-itemizer/internal/metrics"
 )
 
 // MockProvider is used when MOCK_OCR=true (ARCHITECTURE.md §1.2). It returns
@@ -53,12 +54,13 @@ func NewMockProvider(fixtureDirs []string, fallbackPath string) (*MockProvider, 
 // Extract looks up the uploaded name without its extension, so
 // receipt-clean.png returns the text of receipt-clean.txt. The name is only
 // a lookup key and is never used as a path.
-func (m *MockProvider) Extract(ctx context.Context, f fileupload.FileUpload) (string, error) {
+func (m *MockProvider) Extract(ctx context.Context, f fileuploadcore.FileUpload) (string, error) {
 	if text, ok := m.texts[nameWithoutExtension(f.FileName)]; ok {
 		return text, nil
 	}
 	slog.Info("mock OCR: no fixture matches the uploaded name, using the fallback",
 		"file_name", f.FileName, "fallback", m.fallbackPath)
+	metrics.RecordMockOCRFallback()
 	return m.fallback, nil
 }
 

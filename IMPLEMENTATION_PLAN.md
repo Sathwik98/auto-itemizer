@@ -13,34 +13,79 @@ This document covers **how the application is built**. [ARCHITECTURE.md](ARCHITE
 
 ## 2. Stack and project layout
 
-**Stack:** Go 1.25 or later, using only the standard library `net/http`, whose router handles methods and path parameters (`POST /receipts/{id}/process`). There are three dependencies:
+**Stack:** Go 1.25 or later, using only the standard library `net/http`, whose router handles methods and path parameters (`POST /receipts/{id}/process`). There are four dependencies:
 
 | Dependency | Why |
 |---|---|
 | `modernc.org/sqlite` | SQLite driver written in pure Go. It needs no CGO or C compiler, so one `go run` starts the service. |
 | `github.com/shopspring/decimal` | Exact decimal arithmetic for money and rates, never `float64` |
 | `github.com/google/uuid` | Ids and stored file names |
+| `github.com/prometheus/client_golang` | The official Prometheus client, behind `GET /metrics` (ARCHITECTURE.md §3.8). Only `internal/metrics` imports it. |
 
 ```
 auto-itemizer/
-├── cmd/server/main.go        # reads config, wires components, starts HTTP, shuts down cleanly on SIGTERM
+├── cmd/server/main.go        # reads config, wires components, starts HTTP, shuts down cleanly on Ctrl-C or SIGTERM
 ├── internal/
 │   ├── config/               # env: PORT, DB_PATH, STORAGE_DIR, FIXTURES_DIR, MOCK_OCR, MOCK_OCR_FALLBACK
-│   ├── httpapi/              # ReceiptController, ExpenseController: routes, request checks, JSON error body (§3.0)
-│   ├── receipt/              # ReceiptService + one repository file per table (receipts, receipt_ocr); guards.go (pure)
-│   │   └── parser/           # Parser built with the tax names; Parse(text) → ParsedReceipt (pure); its own package so expense can import it
-│   ├── expense/              # ExpenseService + one repository file per table (expense, expense_tax, expense_line_item, tax_master); itemize.go: itemize and reconcile (pure)
+│   ├── httpapi/              # router: routes, JSON 404/405, panic recovery (+ the API tests)
+│   │   ├── models/           # JSON request and response bodies (ExpenseResponse, ItemRequest, ErrorResponse, …)
+│   │   └── respond/          # writes JSON; maps service errors to status codes and error bodies (§3.0)
+│   ├── receipt/
+│   │   ├── server/           # ReceiptController
+│   │   ├── service/          # ReceiptService
+│   │   ├── core/             # Receipt, statuses, errors; guards.go (pure)
+│   │   │   └── parser/       # Parser built with the tax names; Parse(text) → ParsedReceipt (pure)
+│   │   └── repository/       # SQL, one file per table: receipts, receipt_ocr
+│   ├── expense/
+│   │   ├── server/           # ExpenseController
+│   │   ├── service/          # ExpenseService
+│   │   ├── core/             # Expense, Tax, LineItem, errors; itemize.go: itemize and reconcile (pure)
+│   │   └── repository/       # SQL, one file per table: expense, expense_tax, expense_line_item, tax_master
+│   ├── fileupload/
+│   │   ├── service/          # FileUploadService; writes files to <STORAGE_DIR>/receipts
+│   │   ├── core/             # FileUpload
+│   │   └── repository/       # SQL: file_upload
 │   ├── ocr/                  # OcrService (generic): Provider interface, MockProvider, LiveProvider ("not configured")
-│   ├── fileupload/           # FileUploadService + repository for file_upload; writes files to STORAGE_DIR
-│   └── db/                   # SQLite connection, embedded schema (.sql), transaction helper passed between services
+│   ├── metrics/              # the Prometheus metrics and GET /metrics; the only package that imports Prometheus
+│   ├── layout/               # a test of the folder rules below
+│   └── db/                   # SQLite connection, migration runner, transaction helper passed between services
+│       └── migrations/       # numbered .sql files, embedded and applied at startup (§3)
 ├── fixtures/
 │   ├── task-a/               # given fixtures and gold.json, unchanged
 │   └── mock-ocr/             # our guard fixtures (§4 below)
-├── storage/                  # uploaded files (gitignored)
+├── scripts/demo.sh           # runs and checks every fixture and endpoint against a running server
+├── storage/                  # uploaded files and the database (gitignored)
 ├── README.md                 # run with one command, curl for every endpoint
 ├── ARCHITECTURE.md           # how the application works
 └── IMPLEMENTATION_PLAN.md    # this file
 ```
+
+**Folder rules**
+- **Feature first.** Each feature folder (`receipt`, `expense`, `fileupload`) has up to four layers:
+  - `server`: HTTP only;
+  - `service`: the business flow, and the only code that writes the feature's tables;
+  - `core`: types and pure rules, with no database code;
+  - `repository`: SQL, one file per table.
+
+  The JSON bodies are kept apart from the `core` types, in `httpapi/models`.
+- **Two rules, checked by the test in `internal/layout`:**
+  - A feature's `repository` is imported only by that feature, so each service writes only its own tables (ARCHITECTURE.md §1). The compiler can't check this, because the SQL functions must be public for `service` to call them.
+  - `core` packages import no database code.
+- **Import names.** Several packages share a name, like `core` or `service`.
+  - Inside its own feature, a package is imported by that name.
+  - From elsewhere it gets a `<feature><layer>` nickname, e.g. `expenseservice`, `fileuploadcore` or `receiptserver`.
+  - Packages with unique names (`parser`, `ocr`, `db`, `models`, `respond`) keep them.
+
+**Settings** (`internal/config`). All are optional. An empty variable counts as unset, and a bad value stops the program with a message naming the variable.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `8080` | Port to listen on, on `127.0.0.1` only: the API has no login, so only this machine can connect |
+| `STORAGE_DIR` | `storage` | Uploaded files go to `<STORAGE_DIR>/receipts/` |
+| `DB_PATH` | `<STORAGE_DIR>/auto-itemizer.db` | The SQLite file, created with its folder |
+| `FIXTURES_DIR` | `fixtures` | The mock OCR reads `<FIXTURES_DIR>/task-a/` and `<FIXTURES_DIR>/mock-ocr/` |
+| `MOCK_OCR` | `true` | `false` selects the live provider, so `process` returns 501 |
+| `MOCK_OCR_FALLBACK` | `<FIXTURES_DIR>/task-a/receipt-clean.txt` | The text used when no fixture matches the uploaded file's name (ARCHITECTURE.md §1.2) |
 
 ---
 
@@ -48,14 +93,19 @@ auto-itemizer/
 
 - **Money and rates in SQLite:** these are `NUMERIC(12,2)` / `NUMERIC(6,4)` in the data model. In SQLite they are declared as `TEXT` and hold decimal strings such as `"17.85"`, because SQLite's `NUMERIC` affinity would quietly convert `17.85` into a floating-point number. In Go they are always `decimal.Decimal`.
 - **Decimal text format:** money is always written with `StringFixed(2)`, e.g. `"15.00"`, both in SQLite and in JSON. Rates are written to SQLite and returned in JSON with `String()`, exactly as parsed (`"0.19"`, or `"0.09975"` for 9.975%), so a printed rate is never rounded. Never use `String()` or the library's default JSON encoding for money: both drop trailing zeros, so `15.00` would come out as `"15"`.
-- **Schema:** `internal/db/schema.sql`, embedded and applied at every startup, with `CREATE TABLE IF NOT EXISTS` and the partial unique indexes from §2. It also has CHECK constraints on `receipts.status`, `expense.itemization_status` and `is_deleted`, and seeds the tax names into `tax_master` (listed under *Tax names for the parser* below). There are no migrations: `CREATE TABLE IF NOT EXISTS` never changes a table that already exists, so after editing `schema.sql`, delete the database file.
+- **Schema: numbered migrations** in `internal/db/migrations/`, embedded in the binary.
+  - `0001_create_tables.sql` has the tables and the partial unique indexes from §2, with CHECK constraints on `receipts.status`, `expense.itemization_status` and `is_deleted`. `0002_seed_tax_names.sql` seeds `tax_master` (listed under *Tax names for the parser* below).
+  - At startup, `db.Open` applies each file that isn't recorded in `schema_migrations (version, name, applied_at)` yet, in number order (`internal/db/migrate.go`). Each file runs in its own `db.InTx` transaction together with its `schema_migrations` row, so a failing file leaves nothing behind, and startup stops with its name. The version is re-checked inside that transaction, which holds the write lock, so two servers starting at once never apply a file twice.
+  - File names must be `NNNN_description.sql`, with a unique 4-digit number. A badly named file or a repeated number stops startup, rather than guessing an order.
+  - To change the schema, add the next number. Never edit or delete a file that has run. There are no down-migrations: to start again, delete the database file.
+  - `0001` and `0002` use `IF NOT EXISTS` and `ON CONFLICT DO NOTHING`, so a database created before migrations existed (by the old `schema.sql`) is adopted with its data.
 - **Other column types:** ids are UUID strings. Timestamps are UTC text in a fixed-width format (`2006-01-02T15:04:05.000000Z`), so they also sort correctly as text. Booleans are `0`/`1`, and `date` is `YYYY-MM-DD`.
 - **`updated_at` always changes on a write.** `db.NextUpdatedAt(prev)` returns the current time, or 1µs after `prev` if the clock hasn't moved past it. This keeps the conflict check in ARCHITECTURE.md §3.0 reliable even for two writes in the same microsecond.
 - **Connection settings:** `foreign_keys` on; `journal_mode=WAL`, so reads don't wait for a write; `busy_timeout=5000`, so a second writer waits instead of failing; and `_txlock=immediate`, so every transaction takes the write lock at `BEGIN` and concurrent writes wait their turn. Without that last setting, two transactions that read and then write fail with `database is locked`; the db tests check this.
 - **Line item order:** items are returned in insertion order (`ORDER BY rowid`), with no position column. `expense_line_item` must therefore stay an ordinary rowid table.
 - **Transactions across services:** `db.InTx` runs a function in one `*sql.Tx`. Repository methods take a `db.Querier`, which both `*sql.DB` and `*sql.Tx` implement. `ReceiptService` opens the transaction and passes it to the `ExpenseService` and `FileUploadService` methods it calls, so a save that spans their tables is one transaction (ARCHITECTURE.md §1.1). A conditional write that matches no row returns `db.ErrConflict` (→ 409). Reads that must agree with each other, like the header, taxes and items of one expense, run in `db.InReadTx`: a read-only transaction that sees one snapshot and doesn't take the write lock, because the driver ignores `_txlock=immediate` for read-only transactions.
-- **ReceiptService ↔ ExpenseService:** they call each other (§1). Go packages can't import each other, so `expense` defines a small interface, `ParsedReceiptSource { GetParsedReceipt(ctx, receiptID) (parser.ParsedReceipt, error) }`. `ReceiptService` implements it, and `main.go` wires the two together. The parser and the `ParsedReceipt` type live in their own package, `internal/receipt/parser`. They can't be in `receipt` itself: `receipt` imports `expense`, so `expense` naming a type from `receipt` would be an import cycle. Imports go one way: `receipt` → `expense`, both of them → `parser`, and `parser` imports no other package of ours.
-- **Tax names for the parser:** the parser is built with `parser.New(taxNames)` and never reads the database itself. In the service the names are the rows of `tax_master`: `main.go` asks ExpenseService for them once at startup and passes the parser to ReceiptService. `schema.sql` seeds VAT, GST, HST, PST, QST, MWST, UST, TVA, IVA, TAX, SALES TAX, CGST, SGST, IGST, UTGST and CESS; the seed runs at every startup with `ON CONFLICT DO NOTHING`, so an existing database picks up new names. Names added while the service runs are recognised after the next restart.
+- **ReceiptService ↔ ExpenseService:** they call each other (§1). Go packages can't import each other, so `expense/service` defines a small interface, `ParsedReceiptSource { GetParsedReceipt(ctx, receiptID) (parser.ParsedReceipt, error) }`. `ReceiptService` implements it, and `main.go` wires the two together. The parser and the `ParsedReceipt` type live in their own package, `internal/receipt/core/parser`. They can't be in `receipt/service`: it imports `expense/service`, so `expense/service` naming a type from it would be an import cycle. Imports go one way: `receipt/service` → `expense/service`, both features → `parser`, and `parser` imports no other package of ours.
+- **Tax names for the parser:** the parser is built with `parser.New(taxNames)` and never reads the database itself. In the service the names are the rows of `tax_master`: `main.go` asks ExpenseService for them once at startup and passes the parser to ReceiptService. Migration `0002_seed_tax_names.sql` seeds VAT, GST, HST, PST, QST, MWST, UST, TVA, IVA, TAX, SALES TAX, CGST, SGST, IGST, UTGST and CESS. A new name comes in through a new migration, which also reaches existing databases. Names added while the service runs are recognised after the next restart.
 - **Fixtures:** the brief expects them at `fixtures/task-a/` in the repo root. Copy them there from `task-a/fixtures/task-a/` unchanged, and leave the `task-a/` folder as it is.
 
 ---
@@ -73,33 +123,62 @@ The folder must exist before the server starts, because the mock provider fails 
 | `header-incomplete.txt` | Has a `TOTAL` line but no merchant or date | 422 `HEADER_INCOMPLETE` |
 | `invalid-values.txt` | e.g. total `0.00`, or tax larger than the total | 422 `INVALID_RECEIPT_VALUES` |
 
+**Extra receipts.** These go beyond the brief's three and also live in `fixtures/mock-ocr/`. They put receipt shapes that were only unit-tested within reach of curl. Each is checked field by field in the API tests (`TestExtraFixtures`).
+
+| File | Shape | Expected |
+|---|---|---|
+| `receipt-gst-qst.txt` | Canada: GST 5% and QST 9.975% on one subtotal | 200 `COMPLETE`; the QST rate is stored exactly (`0.09975`); both `taxable_amount`s are null, because the subtotal is shared |
+| `receipt-cgst-sgst.txt` | India: `CGST @ 9%` and `SGST @ 9%`, INR | 200 `COMPLETE`; two tax rows, CGST and SGST |
+| `receipt-discount.txt` | A `Discount 10%  -1.40` line before VAT | 200 `COMPLETE`; the discount is a line item with a negative amount; VAT's `taxable_amount` is the subtotal, 12.60 |
+
 ---
 
 ## 5. Tests
 
-- **Unit tests** for the pure functions: the parser in `receipt/parser`, the guards in `receipt`, itemize and reconcile in `expense`.
-- **Golden tests:** the parser's test compares each fixture's header, taxes and candidate lines with `gold.json`. ExpenseService's test runs each fixture through parse → itemize and compares the items and `itemize_status`. The guards are tested on the same fixtures in `receipt`.
+- **Unit tests** for the pure functions: the parser in `receipt/core/parser`, the guards in `receipt/core`, itemize and reconcile in `expense/core`.
+- **Golden tests:** the parser's test compares each fixture's header, taxes and candidate lines with `gold.json`. The `expense/core` test runs each fixture through parse → itemize and compares the items and `itemize_status`. The guards are tested on the same fixtures in `receipt/core`.
+- **Layout test** (`internal/layout`): reads every package's imports with Go's `go/build` and fails if a feature's `repository` is imported from outside the feature, or a `core` package imports database code (§2).
+- **Observability tests** read the counters by scraping `/metrics` and the logs by swapping `slog`'s default logger. They cover:
+  - each request line and its level;
+  - `unmatched` for unknown paths;
+  - every receipt outcome, including `OCR_FAILED` through a failing OCR provider;
+  - that an outcome whose save hits a conflict isn't counted;
+  - refused and accepted PATCHes, write conflicts, internal errors and panics;
+  - an 11 MB upload over a real socket still getting its 413;
+  - a client that leaves during OCR, logged and counted as 499.
+- **Signal tests** (`cmd/server`) run the test binary again as a real server process: one Ctrl-C drains and exits 0, and a second Ctrl-C ends it at once even with a request in flight.
 - **API tests** use `httptest` against a temporary SQLite database. They cover upload → process → get for the three fixtures, re-itemize, `PATCH` returning 409 and 200, reprocessing, every guard fixture, the mock fallback (an unknown file name gets the gold text), upload errors (400, 413, 415), 404 for unknown and soft-deleted ids, 501 with `MOCK_OCR=false`, `GET /receipts/{id}` after a failure and after reprocessing, and `GET /health`. They also cover the `PATCH` body errors (`INVALID_BODY`, `INVALID_ITEM`, `UNKNOWN_ITEM`), the JSON 404 and 405 for an unknown path or a wrong method, a panic or unexpected error becoming a generic 500, and every amount in a response having exactly two decimals.
 - **Service tests** cover what the API can't trigger: `OCR_FAILED` with a fake OCR provider that returns an error, and `409 CONFLICT` with a stale `updated_at`.
+- **PATCH overrides** are tested in the service and through the API: split, merge and edit (including a discount line), each refused when the items stop adding up. Uploads are tested with PNG, JPEG and PDF.
+- **Database tests:** every table and index exists by name, and opening a database twice leaves each seeded tax name once. The migration tests cover:
+  - a fresh database gets `0001` and `0002` once, and reopening applies nothing;
+  - a database made before migrations is adopted, with its data;
+  - a failing file is rolled back and named, and the files before it stay;
+  - a file added later is applied on the next start;
+  - files run in number order;
+  - a badly named file or a repeated number stops startup.
+- **End-to-end script:** `scripts/demo.sh` runs against a started server and makes 36 checks over real HTTP, across every fixture and endpoint. It exits 1 if any check fails.
 
 ---
 
 ## 6. Component plans
 
-Components are built bottom-up, in import order: a package is built after the packages it imports. `receipt` imports `expense`, so ExpenseService comes before ReceiptService (§3). Each component's plan is written in plan mode and reviewed with gstack's `/plan-eng-review` before it is coded.
+Components are built bottom-up, in import order: a package is built after the packages it imports. `receipt/service` imports `expense/service`, so ExpenseService comes before ReceiptService (§3). Each component's plan was written and reviewed before it was coded.
 
 | Component | Package | Status |
 |---|---|---|
-| Project setup (module, fixtures copy, git) | — | done, except the first git commit (waiting on the git name and email) |
+| Project setup (module, fixtures copy, git) | — | done; first commit on `feature_auto_itemizer` |
 | Database (connection, schema, transactions) | `internal/db` | done |
-| FileUploadService | `internal/fileupload` | done |
+| FileUploadService | `internal/fileupload/{core,repository,service}` | done |
 | OcrService (generic, mock and live providers) | `internal/ocr` | done |
-| Receipt parser and guards, and the guard fixtures in `fixtures/mock-ocr/` (§4) | `internal/receipt/parser`, `internal/receipt` (`guards.go`) | done |
-| ExpenseService (create, get, re-itemize, patch, itemize, reconcile), one repository file per table | `internal/expense` | done |
-| ReceiptService (upload, process, status, `getParsedReceipt`), one repository file per table | `internal/receipt` | done |
-| Controllers (ReceiptController, ExpenseController) | `internal/httpapi` | done |
-| Config and startup (wiring, graceful shutdown) | `cmd/server`, `internal/config` | next |
-| README with curls | — | to do |
+| Receipt parser and guards, and the guard fixtures in `fixtures/mock-ocr/` (§4) | `internal/receipt/core/parser`, `internal/receipt/core` (`guards.go`) | done |
+| ExpenseService (create, get, re-itemize, patch, itemize, reconcile), one repository file per table | `internal/expense/{core,repository,service}` | done |
+| ReceiptService (upload, process, status, `getParsedReceipt`), one repository file per table | `internal/receipt/{core,repository,service}` | done |
+| Controllers (ReceiptController, ExpenseController) | `internal/receipt/server`, `internal/expense/server`, `internal/httpapi` (router, `models`, `respond`) | done |
+| Feature-first folders and the layout test (§2), on branch `refactor_feature_folders` | all of `internal/` | done |
+| Config and startup (wiring, graceful shutdown) | `cmd/server`, `internal/config` | done |
+| Observability: a request log line, event logs, Prometheus metrics at `/metrics` (an extra, ARCHITECTURE.md §3.8) | `internal/metrics`, `internal/httpapi` | done |
+| README with curls, `scripts/demo.sh`, and numbered migrations for the schema | `README.md`, `scripts/`, `internal/db` | done |
 
 **Notes for later components** (from the review on 2026-09-27):
 - **ReceiptService (done):**
@@ -107,7 +186,7 @@ Components are built bottom-up, in import order: a package is built after the pa
   - A client that disconnects during OCR gets its context error, and nothing is written.
   - Any other OCR error or a timeout is `OCR_FAILED`, which is saved.
   - Every `receipts` write is conditional on `updated_at`.
-- **Controllers (done), error mapping** in `writeError` (`internal/httpapi/respond.go`). Every code a client can see is listed in ARCHITECTURE.md §3.0.
+- **Controllers (done), error mapping** in `respond.WriteError` (`internal/httpapi/respond`). Every code a client can see is listed in ARCHITECTURE.md §3.0.
 
   | Service error | Response |
   |---|---|
@@ -124,4 +203,14 @@ Components are built bottom-up, in import order: a package is built after the pa
   - `TaxNames` returns the `tax_master` names.
   - Rates are stored exactly.
   - `FAILED` is reserved, because the stub parser never fails.
-- **Config and startup:** load the tax names once at startup with `expenses.TaxNames`, build the parser with `parser.New`, and pass it to ReceiptService. Build ExpenseService first (`expense.New`), then ReceiptService with it, then call `expenses.SetParsedReceiptSource(receipts)`: the two services need each other. To propose in that step's plan: refuse to start if the list is empty, because then no line would be read as a tax. `MOCK_OCR` defaults to `true`, so one command runs the service. `DB_PATH` needs a file default, because `db.Open` refuses an empty path (the SQLite driver would ignore the connection settings in §3) and `:memory:` (each pooled connection would get its own empty database). The OCR timeout passed to `ocr.New` is a constant in `main.go`, e.g. 30 s.
+- **Config and startup (done)**, in `cmd/server/main.go`:
+  - **Order:** the OCR provider is built first, so a wrong `FIXTURES_DIR` fails before any file is created. Then the database is opened, and ExpenseService is built. Its `TaxNames` feed `parser.New`, then ReceiptService is built, then `SetParsedReceiptSource` connects the two.
+  - **No tax names, no start.** It refuses to start if `tax_master` has no names, because then `VAT 19% 2.85` would be read as an item and the receipt could still come out `COMPLETE`.
+  - **Listening:** on `127.0.0.1` only, because the API has no login.
+  - **Timeouts:**
+    - OCR: 30 s.
+    - `ReadHeaderTimeout`: 5 s. `ReadTimeout`: 1 min.
+    - `WriteTimeout`: 2 min. It stays above the OCR timeout because it doesn't stop the handler.
+    - `IdleTimeout`: 2 min.
+  - **Shutdown:** Ctrl-C or SIGTERM drains the requests in flight for up to 10 s. `Shutdown` gets a fresh context, because the signal context is already cancelled. After the first signal `signalContext` releases the signals, so a second Ctrl-C ends the program at once.
+  - **`DB_PATH` needs a file path:** `db.Open` refuses an empty path and `:memory:` (§3).
